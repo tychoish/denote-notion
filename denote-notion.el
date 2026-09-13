@@ -27,9 +27,12 @@
 (require 'cl-lib)
 (require 'denote)
 
+(require 'annotated-completing-read)
+
 (declare-function org-export-to-buffer "ox")
-(declare-function annotated-completing-read "annotated-completing-read")
 (declare-function denote-dash--file-at-point "denote-dash")
+(declare-function denote-dash-file-at-point "denote-dash") ;; future proof
+(declare-function denote-sequence-hierarchy-find-file "denote-sequence")
 
 (defun denote-notion--file-at-point ()
   "Return the denote file implied by the current point/buffer context, or nil.
@@ -37,9 +40,16 @@ Uses `denote-dash--file-at-point' when `denote-dash' is loaded, so a note
 that's merely selected at point in a `denote-dash' or sequence-hierarchy
 listing resolves correctly instead of requiring the file to be the
 current buffer's own visited file.  Falls back to `buffer-file-name'."
-  (if (fboundp 'denote-dash--file-at-point)
-      (denote-dash--file-at-point)
-    (buffer-file-name)))
+  (cond
+   ((and (fboundp 'denote-sequence-hierarchy-find-file)
+	 (derived-mode-p 'denote-sequence-hierarchy-mode))
+    (denote-sequence-hierarchy-find-file))
+   ((and (fboundp 'denote-dash--file-at-point)
+	 (derived-mode-p 'denote-dash-mode))
+   ((and (fboundp 'denote-dash-file-at-point)
+	 (derived-mode-p 'denote-dash-mode))
+    (denote-dash-file-at-point))
+   (t (buffer-file-name))))
 
 ;;; Custom variables
 
