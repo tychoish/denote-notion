@@ -1,0 +1,9 @@
+*.elc
+*-autoloads.el
+*-pkg.el
+.deps/
+*~
+.#*
+\#*\#
+.projectile
+.projectile-cache.eld

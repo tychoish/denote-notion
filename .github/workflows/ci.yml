@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    container: silex/emacs:${{ matrix.emacs_version }}-ci
+    timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      matrix:
+        emacs_version:
+          - "29.4"
+          - "30.2"
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Dependencies
+        run: |
+          emacs --batch \
+            --eval "(progn
+              (require 'package)
+              (setq package-archives '((quote gnu . \"https://elpa.gnu.org/packages/\")
+                                       (quote melpa . \"https://melpa.org/packages/\")
+                                       (quote elpaish . \"https://tychoish.github.io/elpaish/snapshot/\")))
+              (package-initialize)
+              (unless package-archive-contents (package-refresh-contents))
+              (dolist (pkg '(denote annotated-completing-read))
+                (unless (package-installed-p pkg)
+                  (package-install pkg))))"
+
+      - name: Run Tests
+        run: |
+          emacs --batch \
+            --eval "(progn (require 'package) (package-initialize))" \
+            -L . \
+            -l test/test-denote-notion.el \
+            -f ert-run-tests-batch-and-exit
