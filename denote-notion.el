@@ -49,7 +49,7 @@ current buffer's own visited file.  Falls back to `buffer-file-name'."
    ((and (fboundp 'denote-dash-file-at-point)
 	 (derived-mode-p 'denote-dash-mode))
     (denote-dash-file-at-point))
-   (t (buffer-file-name))))
+   (t (buffer-file-name)))))
 
 ;;; Custom variables
 
