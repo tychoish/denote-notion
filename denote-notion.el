@@ -44,12 +44,11 @@ current buffer's own visited file.  Falls back to `buffer-file-name'."
    ((and (fboundp 'denote-sequence-hierarchy-find-file)
 	 (derived-mode-p 'denote-sequence-hierarchy-mode))
     (denote-sequence-hierarchy-find-file))
-   ((and (fboundp 'denote-dash--file-at-point)
-	 (derived-mode-p 'denote-dash-mode))
-   ((and (fboundp 'denote-dash-file-at-point)
-	 (derived-mode-p 'denote-dash-mode))
+   ((fboundp 'denote-dash--file-at-point)
+    (denote-dash--file-at-point))
+   ((fboundp 'denote-dash-file-at-point)
     (denote-dash-file-at-point))
-   (t (buffer-file-name)))))
+   (t (buffer-file-name))))
 
 ;;; Custom variables
 
