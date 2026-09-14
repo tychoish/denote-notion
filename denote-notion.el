@@ -83,6 +83,17 @@ per-machine, e.g. in casap.el for a personal workspace."
                                     (alist :key-type symbol :value-type sexp)))
   :group 'denote-notion)
 
+(defcustom denote-notion-export-auto-push-linked-notes nil
+  "When non-nil, auto-push an untracked `denote:'-linked note before falling back.
+A `denote:' link found while exporting a note's body (see
+`denote-notion--rewrite-denote-links') that points to a real but
+not-yet-Notion-tracked note is, when this is non-nil, pushed first (via
+`denote-notion-push', recursively) so the link can still resolve to a
+Notion URL; when nil (the default), such a link always falls back to
+plain text instead, exactly as it did before this option existed."
+  :type 'boolean
+  :group 'denote-notion)
+
 (defun denote-notion--parent-arg (parent)
   "Format PARENT, a (TYPE . ID) cons, as an `ntn --parent' string.
 TYPE is one of the symbols `page', `database', or `data-source'."
@@ -141,6 +152,20 @@ assume specific keys)."
     (insert (format "\n--- ntn %s ---\n" (string-join args " ")))
     (insert "-- stdout --\n" stdout)
     (insert "-- stderr --\n" stderr)))
+
+(defun denote-notion--report-dangling-links (dangling-links)
+  "Report DANGLING-LINKS (see `denote-notion--rewrite-denote-links') to the user.
+No-op if DANGLING-LINKS is nil.  Otherwise, messages a one-line count
+and appends full detail to `denote-notion--debug-buffer-name'."
+  (when dangling-links
+    (message "Push: %d denote: link(s) did not resolve to a Notion page; see %s"
+             (length dangling-links) denote-notion--debug-buffer-name)
+    (with-current-buffer (get-buffer-create denote-notion--debug-buffer-name)
+      (goto-char (point-max))
+      (insert "\n--- dangling links ---\n")
+      (dolist (entry dangling-links)
+        (pcase-let ((`(,desc ,id ,reason ,source-file) entry))
+          (insert (format "  %S (%s) — %s, from %s\n" desc id reason source-file)))))))
 
 (defun denote-notion--run-json (args)
   "Run \"npx ntn\" with ARGS and return the parsed JSON result.
@@ -223,23 +248,138 @@ must already be visited or is visited (and saved) as part of this call."
     (string-trim (buffer-substring-no-properties (point) (point-max)))))
 
 (defun denote-notion--org-to-markdown (org-body)
-  "Convert ORG-BODY (a string of Org markup) to Markdown via `ox-md'."
+  "Convert ORG-BODY (a string of Org markup) to Markdown via `ox-md'.
+Shadows `denote-link-ol-export' for the dynamic extent of the export
+call only, so an Org-source `denote:' link exports to the same
+intermediate Markdown shape a Markdown source has natively --
+`[desc](denote:ID)' -- instead of Org's built-in behavior of baking in
+the target's absolute local filesystem path.  `cl-letf' is used rather
+than `org-link-set-parameters' since it restores the function cell
+automatically, even on a non-local exit, without mutating the global
+link-type registry.  The export's `:with-toc' option is disabled so a
+spurious \"Table of Contents\" heading is never injected into the
+exported body."
   (require 'ox-md)
   (with-temp-buffer
     (insert org-body)
     (org-mode)
-    (let ((md-buffer (org-export-to-buffer 'md (generate-new-buffer-name "*denote-notion-md*"))))
+    (let ((md-buffer
+           (cl-letf (((symbol-function 'denote-link-ol-export)
+                      (lambda (link description _format)
+                        (pcase-let ((`(,_path ,query ,_search)
+                                     (denote-link--ol-resolve-link-to-target link :full-data)))
+                          (format "[%s](denote:%s)" description query)))))
+             (org-export-to-buffer 'md (generate-new-buffer-name "*denote-notion-md*")
+                                    nil nil nil nil '(:with-toc nil)))))
       (unwind-protect
           (with-current-buffer md-buffer
             (string-trim (buffer-string)))
         (kill-buffer md-buffer)))))
 
 (defun denote-notion--export-body (file)
-  "Return FILE's body, converted to Markdown if FILE is an Org note."
-  (let ((body (denote-notion--body-without-front-matter file)))
-    (if (eq (denote-filetype-heuristics file) 'org)
-        (denote-notion--org-to-markdown body)
-      body)))
+  "Return a cons (CONTENT . DANGLING-LINKS) for FILE's exportable body.
+The body is converted to Markdown first if FILE is an Org note, then
+run through `denote-notion--rewrite-denote-links' to resolve any
+`denote:' links to Notion page URLs."
+  (let* ((body (denote-notion--body-without-front-matter file))
+         (converted (if (eq (denote-filetype-heuristics file) 'org)
+                        (denote-notion--org-to-markdown body)
+                      body)))
+    (denote-notion--rewrite-denote-links converted file)))
+
+(defvar denote-notion--auto-push-in-flight nil
+  "Hash table of Denote identifiers mid-push in the current call chain, or nil.
+Bound (to a fresh `:test \\='equal' hash table, unless already bound) by
+`denote-notion-push', and consulted by `denote-notion--auto-push-dependency'
+to detect and break a `denote:' link cycle when
+`denote-notion-export-auto-push-linked-notes' is non-nil -- without this,
+note A linking to note B linking back to note A would recurse forever.")
+
+(defun denote-notion--format-notion-link (desc target)
+  "Return a Markdown link with DESC as its text, to TARGET's Notion page.
+TARGET must already be Notion-tracked (see `denote-notion--tracked-p') --
+its `notion_id' front-matter value is read and any hyphens stripped to
+build the `https://www.notion.so/...' URL."
+  (let* ((notion-id (string-trim (denote-notion--frontmatter-get target "notion_id") "\"" "\""))
+         (clean-id (string-replace "-" "" notion-id)))
+    (format "[%s](https://www.notion.so/%s)" desc clean-id)))
+
+(defun denote-notion--auto-push-dependency (id target-file)
+  "Push TARGET-FILE (Denote identifier ID) if untracked, breaking link cycles.
+Returns non-nil once TARGET-FILE is Notion-tracked -- either it already
+was, or this call just pushed it via `denote-notion-push' (recursively).
+Returns nil instead of recursing when ID is already recorded in
+`denote-notion--auto-push-in-flight', i.e. TARGET-FILE's own push is
+already in progress somewhere higher up the current call chain (a link
+cycle) -- the caller falls back to plain text with reason
+`cycle-detected' in that case.  Any failure inside the recursive
+`denote-notion-push' call (an `ntn' error, an unanswered parent prompt)
+propagates normally and aborts the whole outer push, exactly as it would
+for a top-level push -- a dependency push failing is treated as the
+whole export failing."
+  (cond
+   ((denote-notion--tracked-p target-file) t)
+   ((and denote-notion--auto-push-in-flight
+         (gethash id denote-notion--auto-push-in-flight))
+    nil)
+   (t
+    (when denote-notion--auto-push-in-flight
+      (puthash id t denote-notion--auto-push-in-flight))
+    (denote-notion-push target-file)
+    t)))
+
+(defun denote-notion--rewrite-denote-links (body source-file)
+  "Rewrite `denote:' Markdown links in BODY to Notion page URLs.
+Scans BODY for every match of `denote-md-link-in-context-regexp'
+\(the Markdown form `[desc](denote:ID)', shared with Org sources once
+`denote-notion--org-to-markdown' has run -- see the Org-shadow task).
+For each match:
+- If `(denote-get-path-by-id id)' returns a tracked file (see
+  `denote-notion--tracked-p'), rewrite the match to
+  `[desc](https://www.notion.so/ID-WITHOUT-DASHES)', where ID-WITHOUT-DASHES
+  is the file's `notion_id' front-matter value with any hyphens stripped.
+- If the file exists but is untracked, and
+  `denote-notion-export-auto-push-linked-notes' is non-nil, the target is
+  pushed first (see `denote-notion--auto-push-dependency'); on success the
+  link is rewritten the same as an already-tracked target.  If that push
+  would recurse into a link cycle instead, or if the option is nil, the
+  match falls back to plain text as below, with reason `cycle-detected'
+  in the cycle case.
+- Otherwise (no file for the id, file exists but untracked with the option
+  off, or a cycle was detected), rewrite the match to just DESC (plain
+  text, link syntax stripped), and push `(desc id reason source-file)'
+  onto an accumulator, REASON one of the symbols `not-yet-pushed' (file
+  exists, untracked), `missing-file' (no file for that id), or
+  `cycle-detected' (auto-push declined to recurse into a link cycle).
+Returns a cons `(REWRITTEN-BODY . DANGLING-LINKS)', DANGLING-LINKS a list
+in the order encountered."
+  (let* (dangling
+         (rewritten
+          (replace-regexp-in-string
+           denote-md-link-in-context-regexp
+           (lambda (whole-match)
+             (save-match-data
+               (string-match denote-md-link-in-context-regexp whole-match)
+               (let* ((id (match-string 1 whole-match))
+                      (desc (match-string 2 whole-match))
+                      (target (denote-get-path-by-id id)))
+                 (cond
+                  ((and target
+                        (or (denote-notion--tracked-p target)
+                            (and denote-notion-export-auto-push-linked-notes
+                                 (denote-notion--auto-push-dependency id target))))
+                   (denote-notion--format-notion-link desc target))
+                  (t
+                   (push (list desc id
+                               (cond
+                                ((not target) 'missing-file)
+                                (denote-notion-export-auto-push-linked-notes 'cycle-detected)
+                                (t 'not-yet-pushed))
+                               source-file)
+                         dangling)
+                   desc)))))
+           body)))
+    (cons rewritten (nreverse dangling))))
 
 ;;; Export
 
@@ -385,25 +525,27 @@ more specific already provides one.
 `ntn pages create --json' returns the created page object directly at
 its top level (unlike `ntn pages get --json', which wraps it under a
 `page' key alongside the converted markdown) — RESULT below is used as
-the page object as-is."
-  (let* ((registry-entry (denote-notion--registry-entry-for-parent parent))
-         (content (denote-notion--export-body file))
-         (page (denote-notion--run-json
-                (list "pages" "create" "--parent" (denote-notion--parent-arg parent)
-                      "--content" content))))
-    (denote-notion--frontmatter-set file "notion_id" (map-elt page 'id))
-    (denote-notion--frontmatter-set file "notion_created" (map-elt page 'created_time))
-    (denote-notion--frontmatter-set file "notion_edited" (map-elt page 'last_edited_time))
-    (denote-notion--frontmatter-set file "notion_parent" (denote-notion--parent-arg parent))
-    (denote-notion--set-tags-from-properties file (map-elt page 'properties))
-    (denote-notion--set-page-title (map-elt page 'id) (map-elt page 'properties)
-                                    (denote-notion--export-title file))
-    (denote-notion--apply-properties
-     (map-elt page 'id)
-     (denote-notion--merge-properties (denote-notion--export-properties file)
-                                       (cdr (cdr registry-entry))
-                                       denote-notion--default-export-properties))
-    (map-elt page 'url)))
+the page object as-is.
+
+Returns a cons (URL . DANGLING-LINKS); see `denote-notion--export-body'."
+  (let ((registry-entry (denote-notion--registry-entry-for-parent parent)))
+    (pcase-let ((`(,content . ,dangling) (denote-notion--export-body file)))
+      (let ((page (denote-notion--run-json
+                   (list "pages" "create" "--parent" (denote-notion--parent-arg parent)
+                         "--content" content))))
+        (denote-notion--frontmatter-set file "notion_id" (map-elt page 'id))
+        (denote-notion--frontmatter-set file "notion_created" (map-elt page 'created_time))
+        (denote-notion--frontmatter-set file "notion_edited" (map-elt page 'last_edited_time))
+        (denote-notion--frontmatter-set file "notion_parent" (denote-notion--parent-arg parent))
+        (denote-notion--set-tags-from-properties file (map-elt page 'properties))
+        (denote-notion--set-page-title (map-elt page 'id) (map-elt page 'properties)
+                                        (denote-notion--export-title file))
+        (denote-notion--apply-properties
+         (map-elt page 'id)
+         (denote-notion--merge-properties (denote-notion--export-properties file)
+                                           (cdr (cdr registry-entry))
+                                           denote-notion--default-export-properties))
+        (cons (map-elt page 'url) dangling)))))
 
 (defun denote-notion--export-update (file force)
   "Update the Notion page already tracked by FILE, or signal a conflict.
@@ -414,9 +556,10 @@ Unlike `ntn pages create --json' (a flat page object with `url',
 only a minimal confirmation object — id/markdown/object/request_id/
 truncated/unknown_block_ids, no `url' or `properties' — so everything
 below the content edit re-fetches the full page object via `pages get'
-rather than reading it from the edit response."
-  (let* ((notion-id (denote-notion--frontmatter-get file "notion_id"))
-         (id (string-trim notion-id "\"" "\"")))
+rather than reading it from the edit response.
+
+Returns a cons (URL . DANGLING-LINKS); see `denote-notion--export-body'."
+  (let ((id (string-trim (denote-notion--frontmatter-get file "notion_id") "\"" "\"")))
     (unless force
       (let* ((remote (map-elt (denote-notion--run-json (list "pages" "get" id)) 'page))
              (remote-edited (map-elt remote 'last_edited_time))
@@ -427,18 +570,18 @@ rather than reading it from the edit response."
           (user-error
            "Notion page %s changed since the last sync (remote %s > stored %s); run `denote-notion-pull' (with no page id, to dwim-refresh) first, or pass force"
            id remote-edited stored-edited))))
-    (let ((content (denote-notion--export-body file)))
-      (denote-notion--run-json (list "pages" "edit" id "--content" content)))
-    (let* ((page (map-elt (denote-notion--run-json (list "pages" "get" id)) 'page))
-           (stored-parent (string-trim (or (denote-notion--frontmatter-get file "notion_parent") "") "\"" "\""))
-           (registry-entry (denote-notion--registry-entry-for-parent
-                             (denote-notion--parse-parent-arg stored-parent)))
-           (default-properties (cdr (cdr registry-entry))))
-      (denote-notion--frontmatter-set file "notion_edited" (map-elt page 'last_edited_time))
-      (denote-notion--set-page-title id (map-elt page 'properties) (denote-notion--export-title file))
-      (denote-notion--apply-properties
-       id (denote-notion--merge-properties (denote-notion--export-properties file) default-properties))
-      (map-elt page 'url))))
+    (pcase-let ((`(,content . ,dangling) (denote-notion--export-body file)))
+      (denote-notion--run-json (list "pages" "edit" id "--content" content))
+      (let* ((page (map-elt (denote-notion--run-json (list "pages" "get" id)) 'page))
+             (stored-parent (string-trim (or (denote-notion--frontmatter-get file "notion_parent") "") "\"" "\""))
+             (registry-entry (denote-notion--registry-entry-for-parent
+                               (denote-notion--parse-parent-arg stored-parent)))
+             (default-properties (cdr (cdr registry-entry))))
+        (denote-notion--frontmatter-set file "notion_edited" (map-elt page 'last_edited_time))
+        (denote-notion--set-page-title id (map-elt page 'properties) (denote-notion--export-title file))
+        (denote-notion--apply-properties
+         id (denote-notion--merge-properties (denote-notion--export-properties file) default-properties))
+        (cons (map-elt page 'url) dangling)))))
 
 ;;;###autoload
 (defun denote-notion-push (&optional file parent force)
@@ -449,13 +592,20 @@ prompted interactively unless `denote-notion-default-parent' is set — and
 a new page is created.  If FILE is already tracked, its Notion page is
 updated, unless the remote page has changed since the last sync, in which
 case a conflict is signaled; pass FORCE (or the prefix argument,
-interactively) to overwrite anyway."
+interactively) to overwrite anyway.  Also reports (see
+`denote-notion--report-dangling-links') any `denote:' links in FILE
+that failed to resolve to a Notion page."
   (interactive (list nil nil current-prefix-arg))
-  (let* ((file (or file (denote-notion--file-at-point) (user-error "No file to export")))
-         (url (if (denote-notion--tracked-p file)
-                  (denote-notion--export-update file force)
-                (denote-notion--export-create file (or parent (denote-notion--read-parent))))))
-    (message "Exported to %s" url)))
+  (let ((denote-notion--auto-push-in-flight
+         (or denote-notion--auto-push-in-flight (make-hash-table :test 'equal))))
+    (let ((file (or file (denote-notion--file-at-point) (user-error "No file to export"))))
+      (puthash (denote-retrieve-filename-identifier file) t denote-notion--auto-push-in-flight)
+      (pcase-let ((`(,url . ,dangling)
+                   (if (denote-notion--tracked-p file)
+                       (denote-notion--export-update file force)
+                     (denote-notion--export-create file (or parent (denote-notion--read-parent))))))
+        (message "Exported to %s" url)
+        (denote-notion--report-dangling-links dangling)))))
 
 ;;; Import
 

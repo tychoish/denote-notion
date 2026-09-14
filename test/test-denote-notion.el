@@ -134,6 +134,293 @@ Untracked body.
                    "## Body\n\nBody content here."))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; denote-notion--org-to-markdown
+
+(ert-deftest test-denote-notion/org-to-markdown-denote-link-keeps-id-form ()
+  "An Org-source `denote:' link is exported to the same intermediate
+Markdown shape a Markdown source has natively -- `[desc](denote:ID)' --
+rather than Org's built-in absolute-file-path behavior."
+  (cl-letf (((symbol-function 'denote-link--ol-resolve-link-to-target)
+             (lambda (link &rest _)
+               (list nil (string-remove-prefix "denote:" link) nil))))
+    (let ((md (denote-notion--org-to-markdown "[[denote:20260105T175200][Example Note]]")))
+      (should (string-match-p (regexp-quote "[Example Note](denote:20260105T175200)") md)))))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; denote-notion--export-body: Org-to-Markdown parity with a Markdown source
+
+(ert-deftest test-denote-notion/export-body-org-source-resolves-same-as-markdown-source ()
+  "`denote-notion--export-body' on an Org-source note whose body contains
+an Org-form `denote:' link resolves to the exact same Notion URL that
+`test-denote-notion/rewrite-denote-links-tracked-target' asserts for a
+Markdown-source note with the equivalent link -- proving Org and
+Markdown sources converge on an identical resolved result, not just an
+identical intermediate `[desc](denote:ID)' form."
+  (test-denote-notion--with-fixture test-denote-notion--md-fixture
+    (let ((org-file (make-temp-file "denote-notion-test" nil ".org")))
+      (unwind-protect
+          (progn
+            (with-temp-file org-file
+              (insert "#+title: Org Source Note\n#+identifier: 20260201T000000\n\n"
+                      "See [[denote:20260101T000000][Other Note]] for context.\n"))
+            (cl-letf (((symbol-function 'denote-link--ol-resolve-link-to-target)
+                       (lambda (link &rest _)
+                         (list nil (string-remove-prefix "denote:" link) nil)))
+                      ((symbol-function 'denote-get-path-by-id)
+                       (lambda (id) (and (equal id "20260101T000000") file))))
+              (let ((result (denote-notion--export-body org-file)))
+                (should (equal (car result)
+                               "See [Other Note](https://www.notion.so/2f094bf731a480818280f0a225af4db2) for context."))
+                (should-not (cdr result)))))
+        (delete-file org-file)))))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; denote-notion--rewrite-denote-links
+
+(ert-deftest test-denote-notion/rewrite-denote-links-tracked-target ()
+  "A `denote:' link to a tracked target is rewritten to a notion.so URL,
+using the target's own notion_id (dashes stripped), and no dangling
+entry is recorded."
+  (test-denote-notion--with-fixture test-denote-notion--md-fixture
+    (cl-letf (((symbol-function 'denote-get-path-by-id)
+               (lambda (id) (and (equal id "20260101T000000") file))))
+      (let* ((body "See [Other Note](denote:20260101T000000) for context.")
+             (result (denote-notion--rewrite-denote-links body "/src/source.md")))
+        (should (equal (car result)
+                        "See [Other Note](https://www.notion.so/2f094bf731a480818280f0a225af4db2) for context."))
+        (should-not (cdr result))))))
+
+(ert-deftest test-denote-notion/rewrite-denote-links-untracked-existing-target ()
+  "A `denote:' link to an existing but untracked target is rewritten to
+plain text (link syntax stripped), and one dangling entry with reason
+`not-yet-pushed' is recorded."
+  (test-denote-notion--with-fixture test-denote-notion--untracked-fixture
+    (cl-letf (((symbol-function 'denote-get-path-by-id)
+               (lambda (id) (and (equal id "20260105T175201") file))))
+      (let* ((body "See [Untracked Note](denote:20260105T175201) for context.")
+             (result (denote-notion--rewrite-denote-links body "/src/source.md")))
+        (should (equal (car result) "See Untracked Note for context."))
+        (should (equal (cdr result)
+                       '(("Untracked Note" "20260105T175201" not-yet-pushed "/src/source.md"))))))))
+
+(ert-deftest test-denote-notion/rewrite-denote-links-missing-file ()
+  "A `denote:' link to a nonexistent id is rewritten to plain text, and
+one dangling entry with reason `missing-file' is recorded."
+  (cl-letf (((symbol-function 'denote-get-path-by-id) (lambda (_id) nil)))
+    (let* ((body "See [Gone Note](denote:20991231T000000) for context.")
+           (result (denote-notion--rewrite-denote-links body "/src/source.md")))
+      (should (equal (car result) "See Gone Note for context."))
+      (should (equal (cdr result)
+                     '(("Gone Note" "20991231T000000" missing-file "/src/source.md")))))))
+
+(ert-deftest test-denote-notion/rewrite-denote-links-mixed-resolved-and-unresolved ()
+  "With two links, one that resolves to a tracked target and one that
+does not, only the unresolved one is reported as dangling, and both
+render correctly in the rewritten body."
+  (test-denote-notion--with-fixture test-denote-notion--md-fixture
+    (cl-letf (((symbol-function 'denote-get-path-by-id)
+               (lambda (id)
+                 (cond
+                  ((equal id "20260101T000000") file)
+                  (t nil)))))
+      (let* ((body (concat "First [Tracked](denote:20260101T000000) link. "
+                           "Second [Missing](denote:20991231T000000) link."))
+             (result (denote-notion--rewrite-denote-links body "/src/source.md")))
+        (should (equal (car result)
+                       (concat "First [Tracked](https://www.notion.so/2f094bf731a480818280f0a225af4db2) link. "
+                               "Second Missing link.")))
+        (should (equal (cdr result)
+                       '(("Missing" "20991231T000000" missing-file "/src/source.md"))))))))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; denote-notion--auto-push-dependency
+
+(ert-deftest test-denote-notion/auto-push-dependency-already-tracked-is-noop ()
+  "Returns non-nil immediately, without calling `denote-notion-push', when
+the target is already tracked."
+  (test-denote-notion--with-fixture test-denote-notion--md-fixture
+    (cl-letf (((symbol-function 'denote-notion-push)
+               (lambda (&rest args) (error "unexpected push: %S" args))))
+      (should (denote-notion--auto-push-dependency "20260105T175200" file)))))
+
+(ert-deftest test-denote-notion/auto-push-dependency-cycle-returns-nil ()
+  "Returns nil, without recursing into `denote-notion-push', when ID is
+already recorded as in-flight -- this is how a `denote:' link cycle is
+broken."
+  (test-denote-notion--with-fixture test-denote-notion--untracked-fixture
+    (let ((denote-notion--auto-push-in-flight (make-hash-table :test 'equal)))
+      (puthash "20260105T175201" t denote-notion--auto-push-in-flight)
+      (cl-letf (((symbol-function 'denote-notion-push)
+                 (lambda (&rest args) (error "unexpected push: %S" args))))
+        (should-not (denote-notion--auto-push-dependency "20260105T175201" file))))))
+
+(ert-deftest test-denote-notion/auto-push-dependency-pushes-untracked-target ()
+  "Records ID as in-flight and pushes the target when it is untracked and
+not already in-flight, returning non-nil afterward."
+  (test-denote-notion--with-fixture test-denote-notion--untracked-fixture
+    (let ((denote-notion--auto-push-in-flight (make-hash-table :test 'equal))
+          (pushed nil))
+      (cl-letf (((symbol-function 'denote-notion-push)
+                 (lambda (target-file &rest _) (setq pushed target-file))))
+        (should (denote-notion--auto-push-dependency "20260105T175201" file)))
+      (should (equal pushed file))
+      (should (gethash "20260105T175201" denote-notion--auto-push-in-flight)))))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; denote-notion--rewrite-denote-links: auto-push (denote-notion-export-auto-push-linked-notes)
+
+(ert-deftest test-denote-notion/rewrite-denote-links-auto-push-resolves-untracked-target ()
+  "With `denote-notion-export-auto-push-linked-notes' non-nil, a link to an
+existing but untracked target is resolved to a Notion URL once
+`denote-notion--auto-push-dependency' reports the target now tracked,
+instead of falling back to plain text."
+  (test-denote-notion--with-fixture test-denote-notion--untracked-fixture
+    (let ((denote-notion-export-auto-push-linked-notes t))
+      (cl-letf (((symbol-function 'denote-get-path-by-id)
+                 (lambda (id) (and (equal id "20260105T175201") file)))
+                ((symbol-function 'denote-notion--auto-push-dependency)
+                 (lambda (_id target-file)
+                   ;; Simulate a successful recursive push: the target
+                   ;; becomes tracked as a side effect.
+                   (denote-notion--frontmatter-set target-file "notion_id" "pushed-page-id")
+                   t)))
+        (let* ((body "See [Untracked Note](denote:20260105T175201) for context.")
+               (result (denote-notion--rewrite-denote-links body "/src/source.md")))
+          (should (equal (car result)
+                         "See [Untracked Note](https://www.notion.so/pushedpageid) for context."))
+          (should-not (cdr result)))))))
+
+(ert-deftest test-denote-notion/rewrite-denote-links-auto-push-cycle-falls-back-to-plain-text ()
+  "With `denote-notion-export-auto-push-linked-notes' non-nil, a link whose
+target is caught in a cycle (`denote-notion--auto-push-dependency' returns
+nil) still falls back to plain text, and is recorded with reason
+`cycle-detected' rather than `not-yet-pushed'."
+  (test-denote-notion--with-fixture test-denote-notion--untracked-fixture
+    (let ((denote-notion-export-auto-push-linked-notes t))
+      (cl-letf (((symbol-function 'denote-get-path-by-id)
+                 (lambda (id) (and (equal id "20260105T175201") file)))
+                ((symbol-function 'denote-notion--auto-push-dependency)
+                 (lambda (&rest _) nil)))
+        (let* ((body "See [Untracked Note](denote:20260105T175201) for context.")
+               (result (denote-notion--rewrite-denote-links body "/src/source.md")))
+          (should (equal (car result) "See Untracked Note for context."))
+          (should (equal (cdr result)
+                         '(("Untracked Note" "20260105T175201" cycle-detected "/src/source.md")))))))))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; denote-notion-push: end-to-end auto-push link cycle (A <-> B)
+;;
+;; A links to B, and B links back to A; auto-push is on.  Pushing A must
+;; terminate rather than recursing forever: B's push is triggered as a
+;; dependency, and when B's own body-export encounters its link back to A
+;; -- whose identifier is already recorded in-flight from the top-level
+;; push of A -- that link falls back to plain text as `cycle-detected'
+;; instead of recursing into A again.  Once B's push completes, A's own
+;; link to B still resolves normally, since B is now tracked.
+
+(ert-deftest test-denote-notion/push-a-links-b-links-a-cycle-terminates-and-resolves ()
+  "A push of A, where A links to B and B links back to A, terminates and
+resolves A's link to B normally, while B's link back to A is reported as
+`cycle-detected' rather than recursing forever.
+Files are given real denote-style filenames (identifier embedded in the
+filename, not just front matter) since
+`denote-notion--auto-push-dependency's in-flight bookkeeping keys off
+`denote-retrieve-filename-identifier', which parses the filename, not
+the front matter."
+  (let* ((id-a "20260201T000000")
+         (id-b "20260201T000001")
+         (dir (make-temp-file "denote-notion-test-" t))
+         (file-a (expand-file-name (format "%s--note-a__tag.md" id-a) dir))
+         (file-b (expand-file-name (format "%s--note-b__tag.md" id-b) dir)))
+    (unwind-protect
+        (let ((denote-notion-export-auto-push-linked-notes t)
+              (denote-notion-default-parent '(database . "db-id"))
+              (create-contents nil))
+          (with-temp-file file-a
+            (insert (format "---\ntitle: \"A\"\nidentifier: \"%s\"\n---\n\nSee [B](denote:%s) here.\n" id-a id-b)))
+          (with-temp-file file-b
+            (insert (format "---\ntitle: \"B\"\nidentifier: \"%s\"\n---\n\nSee [A](denote:%s) here.\n" id-b id-a)))
+          (cl-letf (((symbol-function 'denote-get-path-by-id)
+                     (lambda (id)
+                       (cond ((equal id id-a) file-a)
+                             ((equal id id-b) file-b))))
+                    ((symbol-function 'denote-notion--run-json)
+                     (lambda (args)
+                       (when (member "create" args)
+                         (push (nth (1+ (seq-position args "--content")) args) create-contents))
+                       (json-parse-string test-denote-notion--create-response-json
+                                          :object-type 'alist :array-type 'list))))
+            (denote-notion-push file-a))
+          ;; B's create (triggered as a dependency of A's export) happens
+          ;; before A's own create call -- see the commentary above.
+          (setq create-contents (nreverse create-contents))
+          (should (denote-notion--tracked-p file-a))
+          (should (denote-notion--tracked-p file-b))
+          (should (equal (length create-contents) 2))
+          (should (equal (nth 0 create-contents) "See A here."))
+          (should (string-match-p (regexp-quote "https://www.notion.so/") (nth 1 create-contents)))
+          (with-current-buffer (get-buffer-create denote-notion--debug-buffer-name)
+            (should (string-match-p "cycle-detected" (buffer-string)))))
+      (dolist (buf (buffer-list))
+        (when-let* ((f (buffer-file-name buf)))
+          (when (string-prefix-p (expand-file-name dir) (expand-file-name f))
+            (with-current-buffer buf (set-buffer-modified-p nil))
+            (kill-buffer buf))))
+      (delete-directory dir t))))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; denote-notion-push: end-to-end auto-push of a non-cyclic dependency
+;; (A -> B, no link back)
+;;
+;; Unlike the A<->B cycle test above, this proves the ordinary, common
+;; case works end-to-end on its own: if the cycle test were ever
+;; simplified or removed, this still stands as the guarantee that a real
+;; `denote-notion-push' call with auto-push enabled actually pushes an
+;; untracked dependency and resolves the link to it.
+
+(ert-deftest test-denote-notion/push-a-links-b-no-cycle-auto-pushes-and-resolves ()
+  "A push of A, where A links to B and B does NOT link back to A, pushes B
+as a dependency and resolves A's link to B to a normal Notion URL."
+  (let* ((id-a "20260301T000000")
+         (id-b "20260301T000001")
+         (dir (make-temp-file "denote-notion-test-" t))
+         (file-a (expand-file-name (format "%s--note-a__tag.md" id-a) dir))
+         (file-b (expand-file-name (format "%s--note-b__tag.md" id-b) dir)))
+    (unwind-protect
+        (let ((denote-notion-export-auto-push-linked-notes t)
+              (denote-notion-default-parent '(database . "db-id"))
+              (create-contents nil))
+          (with-temp-file file-a
+            (insert (format "---\ntitle: \"A\"\nidentifier: \"%s\"\n---\n\nSee [B](denote:%s) here.\n" id-a id-b)))
+          (with-temp-file file-b
+            (insert (format "---\ntitle: \"B\"\nidentifier: \"%s\"\n---\n\nJust B, no links back.\n" id-b)))
+          (cl-letf (((symbol-function 'denote-get-path-by-id)
+                     (lambda (id)
+                       (cond ((equal id id-a) file-a)
+                             ((equal id id-b) file-b))))
+                    ((symbol-function 'denote-notion--run-json)
+                     (lambda (args)
+                       (when (member "create" args)
+                         (push (nth (1+ (seq-position args "--content")) args) create-contents))
+                       (json-parse-string test-denote-notion--create-response-json
+                                          :object-type 'alist :array-type 'list))))
+            (denote-notion-push file-a))
+          ;; B's create (triggered as a dependency of A's export) happens
+          ;; before A's own create call, as in the cycle test above.
+          (setq create-contents (nreverse create-contents))
+          (should (denote-notion--tracked-p file-b))
+          (should (equal (length create-contents) 2))
+          (should (equal (nth 0 create-contents) "Just B, no links back."))
+          (should (string-match-p "\\[B\\](https://www\\.notion\\.so/[[:alnum:]]+) here\\."
+                                  (nth 1 create-contents))))
+      (dolist (buf (buffer-list))
+        (when-let* ((f (buffer-file-name buf)))
+          (when (string-prefix-p (expand-file-name dir) (expand-file-name f))
+            (with-current-buffer buf (set-buffer-modified-p nil))
+            (kill-buffer buf))))
+      (delete-directory dir t))))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; denote-notion--extract-page-id
 
 (ert-deftest test-denote-notion/extract-page-id-from-bare-id ()
@@ -260,7 +547,7 @@ need stubbing here."
                                       :object-type 'alist :array-type 'list))
                   (t (error "unexpected call in force path: %S" args))))))
       (should (equal (denote-notion--export-update file t)
-                     "https://app.notion.com/p/tracked")))
+                     (cons "https://app.notion.com/p/tracked" nil))))
     (should (equal (denote-notion--frontmatter-get file "notion_edited")
                    "\"2026-04-01T00:00:00.000Z\""))))
 
