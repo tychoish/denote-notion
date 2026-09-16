@@ -12,37 +12,17 @@ concurrency:
 jobs:
   test:
     runs-on: ubuntu-latest
-    container: silex/emacs:${{ matrix.emacs_version }}-ci
+    container: silex/emacs:${{ matrix.emacs-version }}-ci
     timeout-minutes: 5
     strategy:
       fail-fast: false
       matrix:
-        emacs_version:
+        emacs-version:
           - "29.4"
           - "30.2"
 
     steps:
       - uses: actions/checkout@v5
 
-      - name: Install Dependencies
-        run: |
-          emacs --batch \
-            --eval '(progn
-              (require (quote package))
-              (setq package-archives (quote (("gnu" . "https://elpa.gnu.org/packages/")
-                                             ("nongnu" . "https://elpa.nongnu.org/nongnu/")
-                                             ("melpa" . "https://melpa.org/packages/")
-                                             ("elpaish" . "https://tychoish.github.io/elpaish/snapshot/"))))
-              (package-initialize)
-              (unless package-archive-contents (package-refresh-contents))
-              (dolist (pkg (quote (denote annotated-completing-read)))
-                (unless (package-installed-p pkg)
-                  (package-install pkg))))'
-
       - name: Run Tests
-        run: |
-          emacs --batch \
-            --eval '(progn (require (quote package)) (package-initialize))' \
-            -L . \
-            -l test/test-denote-notion.el \
-            -f ert-run-tests-batch-and-exit
+        uses: tychoish/elisp-ci@v0.1.0
