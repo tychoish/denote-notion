@@ -84,7 +84,7 @@ per-machine, e.g. in casap.el for a personal workspace."
   :group 'denote-notion)
 
 (defcustom denote-notion-export-auto-push-linked-notes nil
-  "When non-nil, auto-push an untracked `denote:'-linked note before falling back.
+  "When non-nil, auto-push untracked `denote:'-linked note before fallback.
 A `denote:' link found while exporting a note's body (see
 `denote-notion--rewrite-denote-links') that points to a real but
 not-yet-Notion-tracked note is, when this is non-nil, pushed first (via
@@ -140,7 +140,7 @@ parses from it."
       (delete-file stderr-file))))
 
 (defconst denote-notion--debug-buffer-name "*denote-notion-debug*"
-  "Name of the buffer holding raw `ntn' CLI output, for `denote-notion--run-json'.")
+  "Name of buffer holding raw `ntn' output for `denote-notion--run-json'.")
 
 (defun denote-notion--debug-log (args stdout stderr)
   "Append the ntn invocation ARGS and its raw STDOUT/STDERR to the debug buffer.
@@ -154,7 +154,7 @@ assume specific keys)."
     (insert "-- stderr --\n" stderr)))
 
 (defun denote-notion--report-dangling-links (dangling-links)
-  "Report DANGLING-LINKS (see `denote-notion--rewrite-denote-links') to the user.
+  "Report DANGLING-LINKS (see `denote-notion--rewrite-denote-links').
 No-op if DANGLING-LINKS is nil.  Otherwise, messages a one-line count
 and appends full detail to `denote-notion--debug-buffer-name'."
   (when dangling-links
@@ -419,7 +419,7 @@ Does nothing if TITLE is nil or PROPERTIES has no `title'-typed entry."
      id (list (cons key (list (cons 'title (denote-notion--rich-text-value title))))))))
 
 (defun denote-notion--set-tags-from-properties (file properties)
-  "Set FILE's notion_tags from Notion page PROPERTIES' Tags multi_select, if any."
+  "Set FILE's notion_tags from Notion page PROPERTIES' Tags, if any."
   (when-let* ((tags-prop (map-elt properties 'Tags))
               (multi-select (map-elt tags-prop 'multi_select))
               (names (seq-map (lambda (tag) (map-elt tag 'name)) multi-select)))
@@ -445,7 +445,8 @@ PROPERTIES — is replaced by calling NILADIC-FN.")
     (nreverse result)))
 
 (defun denote-notion--resolve-property-sentinels (value)
-  "Recursively replace sentinel strings (see `denote-notion--property-sentinels') in VALUE."
+  "Recursively replace sentinel strings in VALUE.
+See `denote-notion--property-sentinels'."
   (cond
    ((stringp value)
     (if-let* ((fn (cdr (assoc value denote-notion--property-sentinels))))
@@ -506,7 +507,7 @@ nil/empty."
       (cons (intern (substring string 0 pos)) (substring string (1+ pos))))))
 
 (defun denote-notion--export-create (file parent)
-  "Create a new Notion page for FILE under PARENT and write back tracking fields.
+  "Create a new Notion page for FILE under PARENT; write back tracking fields.
 PARENT is a (TYPE . ID) cons; see `denote-notion-default-parent'.  The
 `type:id' form of PARENT itself (not any `denote-notion-parent-registry'
 entry's name) is recorded as `notion_parent', so a later
