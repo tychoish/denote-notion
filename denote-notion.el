@@ -608,14 +608,80 @@ that failed to resolve to a Notion page."
         (message "Exported to %s" url)
         (denote-notion--report-dangling-links dangling)))))
 
+;;; Registry maintenance
+
+(defun denote-notion--resolve-data-source (id-or-url)
+  "Resolve ID-OR-URL to a Notion data source, returning an (ID . NAME) cons.
+ID-OR-URL is a database id, a data source id, or a Notion URL for either
+-- see `denote-notion--extract-page-id' for the accepted forms.  Runs
+\"ntn datasources resolve\" on the extracted id: a bare data source id
+resolves to itself, and a database id resolves to the data source
+`denote-notion-parent-registry' actually needs to work with `ntn
+pages create --parent'.  Pasting a full-page database's own URL and
+registering its id directly, without this resolution step, is exactly
+the mistake this function exists to catch early: that id looks like a
+valid parent locator, but the Notion API only rejects it as
+`object_not_found' much later, at export time, not when the registry
+entry was written.  When the database holds more than one data source,
+prompts via `completing-read' to pick one by name."
+  (let* ((id (denote-notion--extract-page-id id-or-url))
+         (result (denote-notion--run-json (list "datasources" "resolve" id)))
+         (data-sources (map-elt result 'data_sources)))
+    (pcase (length data-sources)
+      (0 (user-error "No data source found for %s" id-or-url))
+      (1 (let ((data-source (car data-sources)))
+           (cons (map-elt data-source 'id) (map-elt data-source 'name))))
+      (_ (let* ((table (mapcar (lambda (data-source)
+                                  (cons (map-elt data-source 'name) (map-elt data-source 'id)))
+                                data-sources))
+                (name (completing-read "Data source: " table nil t)))
+           (cons (cdr (assoc name table)) name))))))
+
+;;;###autoload
+(defun denote-notion-add-parent (url &optional name)
+  "Resolve URL to a Notion data source and add it to
+`denote-notion-parent-registry'.
+URL is a Notion database or data source URL, or a bare id -- see
+`denote-notion--resolve-data-source', which does the actual resolution.
+NAME is the entry's display name in the `denote-notion--acr-select-parent'
+menu; when omitted it defaults to, and is interactively prompted for
+with a default of, the data source's own Notion name.
+
+Adds `(NAME . ((data-source . ID)))' to the front of the in-memory
+`denote-notion-parent-registry', replacing any existing entry already
+registered under NAME, and also copies that same form to the kill ring:
+the registry itself is ordinarily populated by a `setq' in an init file
+that this command neither reads nor writes, so the kill ring is what
+carries the entry to wherever that `setq' lives for it to survive a
+restart."
+  (interactive "sNotion URL or id: ")
+  (let* ((resolved (denote-notion--resolve-data-source url))
+         (id (car resolved))
+         (name (or name
+                   (and (called-interactively-p 'interactive)
+                        (read-string "Registry name: " (cdr resolved)))
+                   (cdr resolved)))
+         (entry (cons name (list (cons 'data-source id))))
+         (form (format "(%S\n . ((data-source . %S)))" name id)))
+    (setq denote-notion-parent-registry
+          (cons entry (assoc-delete-all name (copy-sequence denote-notion-parent-registry))))
+    (kill-new form)
+    (message "Added %s -> data-source:%s to denote-notion-parent-registry (form copied to kill ring)" name id)))
+
 ;;; Import
 
 (defun denote-notion--extract-page-id (id-or-url)
-  "Return the 32-char hex page id embedded in ID-OR-URL."
-  (if (string-match "\\([0-9a-fA-F]\\{32\\}\\)\\'"
-                    (replace-regexp-in-string "-" "" id-or-url))
-      (match-string 1 (replace-regexp-in-string "-" "" id-or-url))
-    id-or-url))
+  "Return the 32-char hex page id embedded in ID-OR-URL.
+Any query string or fragment is stripped first, e.g. the trailing
+\"?v=<view-id>\" on a database URL like
+\"https://app.notion.com/p/<id>?v=<view-id>\" -- otherwise the view id's
+own 32 hex characters, not the database id's, would be the last thing
+in the string and would be extracted instead."
+  (let ((trimmed (replace-regexp-in-string "[?#].*\\'" "" id-or-url)))
+    (if (string-match "\\([0-9a-fA-F]\\{32\\}\\)\\'"
+                      (replace-regexp-in-string "-" "" trimmed))
+        (match-string 1 (replace-regexp-in-string "-" "" trimmed))
+      id-or-url)))
 
 (defun denote-notion--clean-imported-body (body)
   "Clean up BODY as returned by `ntn pages get' for storage in a denote note.

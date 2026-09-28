@@ -434,6 +434,14 @@ as a dependency and resolves A's link to B to a normal Notion URL."
                   "https://app.notion.com/p/Example-2e994bf731a4800d99fbf40866cc0e65")
                  "2e994bf731a4800d99fbf40866cc0e65")))
 
+(ert-deftest test-denote-notion/extract-page-id-strips-trailing-view-query-param ()
+  "A database URL's trailing \"?v=<view-id>\" is stripped before matching,
+so the view id's own 32 hex characters -- last in the raw string -- are
+never mistaken for the database id."
+  (should (equal (denote-notion--extract-page-id
+                  "https://app.notion.com/p/ea4eefe5a1054e0599b49a1a11aadea8?v=ae682ebf81954ca7a910e101133a6085")
+                 "ea4eefe5a1054e0599b49a1a11aadea8")))
+
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; denote-notion--run / denote-notion--run-json (call-process stubbed)
 
@@ -475,6 +483,102 @@ as a dependency and resolves A's link to B to a normal Notion URL."
   "Returns nil for a nil or empty string, rather than erroring."
   (should-not (denote-notion--parse-parent-arg nil))
   (should-not (denote-notion--parse-parent-arg "")))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; denote-notion--resolve-data-source
+;;
+;; A pasted full-page database URL's id is the *database* id, not the
+;; data source id the registry needs -- these fixtures mirror
+;; "ntn datasources resolve"'s real response shape (a `database_id' and a
+;; `data_sources' array) so the resolution step is covered without a
+;; live network call.
+
+(ert-deftest test-denote-notion/resolve-data-source-single-result-no-prompt ()
+  "A database with exactly one data source resolves without prompting."
+  (cl-letf (((symbol-function 'denote-notion--run-json)
+             (lambda (&rest _)
+               (json-parse-string
+                "{\"data_sources\": [{\"id\": \"ds-1\", \"name\": \"Scope and Design\"}], \"database_id\": \"db-1\"}"
+                :object-type 'alist :array-type 'list)))
+            ((symbol-function 'completing-read)
+             (lambda (&rest _) (error "should not prompt for a single data source"))))
+    (should (equal (denote-notion--resolve-data-source "db-1")
+                   '("ds-1" . "Scope and Design")))))
+
+(ert-deftest test-denote-notion/resolve-data-source-extracts-id-from-url ()
+  "Resolves via the 32-char hex id embedded in a full Notion URL."
+  (cl-letf (((symbol-function 'denote-notion--run-json)
+             (lambda (args)
+               (should (equal (nth 2 args) "ea4eefe5a1054e0599b49a1a11aadea8"))
+               (json-parse-string
+                "{\"data_sources\": [{\"id\": \"ds-1\", \"name\": \"Scope and Design\"}], \"database_id\": \"db-1\"}"
+                :object-type 'alist :array-type 'list))))
+    (should (equal (denote-notion--resolve-data-source
+                    "https://app.notion.com/p/ea4eefe5a1054e0599b49a1a11aadea8?v=ae682ebf81954ca7a910e101133a6085")
+                   '("ds-1" . "Scope and Design")))))
+
+(ert-deftest test-denote-notion/resolve-data-source-prompts-among-multiple ()
+  "A database with more than one data source prompts to pick by name."
+  (cl-letf (((symbol-function 'denote-notion--run-json)
+             (lambda (&rest _)
+               (json-parse-string
+                "{\"data_sources\": [{\"id\": \"ds-1\", \"name\": \"First\"}, {\"id\": \"ds-2\", \"name\": \"Second\"}], \"database_id\": \"db-1\"}"
+                :object-type 'alist :array-type 'list)))
+            ((symbol-function 'completing-read)
+             (lambda (&rest _) "Second")))
+    (should (equal (denote-notion--resolve-data-source "db-1")
+                   '("ds-2" . "Second")))))
+
+(ert-deftest test-denote-notion/resolve-data-source-errors-on-empty-result ()
+  "Signals a `user-error' rather than returning a bogus cons when
+\"ntn datasources resolve\" reports no data sources at all."
+  (cl-letf (((symbol-function 'denote-notion--run-json)
+             (lambda (&rest _)
+               (json-parse-string "{\"data_sources\": [], \"database_id\": \"db-1\"}"
+                                  :object-type 'alist :array-type 'list))))
+    (should-error (denote-notion--resolve-data-source "db-1") :type 'user-error)))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; denote-notion-add-parent
+
+(ert-deftest test-denote-notion/add-parent-adds-registry-entry ()
+  "Adds a `(NAME . ((data-source . ID)))' entry built from the resolved id."
+  (let ((denote-notion-parent-registry nil))
+    (cl-letf (((symbol-function 'denote-notion--resolve-data-source)
+               (lambda (_url) '("ds-1" . "Scope and Design"))))
+      (denote-notion-add-parent "db-1" "Scope and Design"))
+    (should (equal denote-notion-parent-registry
+                   '(("Scope and Design" . ((data-source . "ds-1"))))))))
+
+(ert-deftest test-denote-notion/add-parent-replaces-existing-same-name-entry ()
+  "Re-adding under a name already in the registry replaces that entry
+rather than appending a duplicate."
+  (let ((denote-notion-parent-registry '(("Scope and Design" . ((data-source . "stale-id"))))))
+    (cl-letf (((symbol-function 'denote-notion--resolve-data-source)
+               (lambda (_url) '("fresh-id" . "Scope and Design"))))
+      (denote-notion-add-parent "db-1" "Scope and Design"))
+    (should (equal denote-notion-parent-registry
+                   '(("Scope and Design" . ((data-source . "fresh-id"))))))))
+
+(ert-deftest test-denote-notion/add-parent-defaults-name-to-resolved-name-noninteractively ()
+  "With no NAME argument and not called interactively, falls back to the
+data source's own Notion name instead of prompting."
+  (let ((denote-notion-parent-registry nil))
+    (cl-letf (((symbol-function 'denote-notion--resolve-data-source)
+               (lambda (_url) '("ds-1" . "Scope and Design")))
+              ((symbol-function 'read-string)
+               (lambda (&rest _) (error "should not prompt for a name"))))
+      (denote-notion-add-parent "db-1"))
+    (should (equal (caar denote-notion-parent-registry) "Scope and Design"))))
+
+(ert-deftest test-denote-notion/add-parent-copies-form-to-kill-ring ()
+  "Also copies the entry's literal sexp form to the kill ring, since the
+registry itself lives in a `setq' this command does not edit."
+  (let ((denote-notion-parent-registry nil))
+    (cl-letf (((symbol-function 'denote-notion--resolve-data-source)
+               (lambda (_url) '("ds-1" . "Scope and Design"))))
+      (denote-notion-add-parent "db-1" "Scope and Design"))
+    (should (equal (current-kill 0) "(\"Scope and Design\"\n . ((data-source . \"ds-1\")))"))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; denote-notion--export-create
