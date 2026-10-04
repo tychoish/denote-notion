@@ -146,6 +146,21 @@ rather than Org's built-in absolute-file-path behavior."
     (let ((md (denote-notion--org-to-markdown "[[denote:20260105T175200][Example Note]]")))
       (should (string-match-p (regexp-quote "[Example Note](denote:20260105T175200)") md)))))
 
+(ert-deftest test-denote-notion/org-to-markdown-table-exports-as-pipe-table ()
+  "An Org table exports to a GFM pipe table, not a raw HTML table -- plain
+`ox-md' has no Markdown table transcoder and always falls back to HTML,
+which Notion's importer does not read back as a table."
+  (let ((md (denote-notion--org-to-markdown "| a | b |\n|---+---|\n| 1 | 2 |\n")))
+    (should (string-match-p (regexp-quote "| a | b |") md))
+    (should-not (string-match-p "<table" md))))
+
+(ert-deftest test-denote-notion/org-to-markdown-src-block-exports-as-fenced-code ()
+  "An Org src block exports to a fenced \"```\" code block, not a
+4-space-indented one -- the fenced form is what round-trips cleanly
+through Notion."
+  (let ((md (denote-notion--org-to-markdown "#+begin_src emacs-lisp\n(+ 1 2)\n#+end_src\n")))
+    (should (string-match-p (regexp-quote "```emacs-lisp") md))))
+
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; denote-notion--export-body: Org-to-Markdown parity with a Markdown source
 
@@ -789,6 +804,15 @@ paragraph break, even after block-level newlines are widened to blank
 lines."
   (should (equal (denote-notion--clean-imported-body "One line<br>continues.\nNext paragraph.")
                  "One line\ncontinues.\n\nNext paragraph.")))
+
+(ert-deftest test-denote-notion/clean-imported-body-preserves-fenced-code-block ()
+  "A fenced code block's internal newlines are left as single newlines,
+not widened to blank lines, so the code's own line breaks survive
+instead of a blank line appearing between every line of code; the
+surrounding prose newlines are still widened into paragraph breaks."
+  (should (equal (denote-notion--clean-imported-body
+                  "Intro.\n```python\ndef f():\n    return 1\n```\nOutro.")
+                 "Intro.\n\n```python\ndef f():\n    return 1\n```\n\nOutro.")))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; denote-notion--rich-text-plain
