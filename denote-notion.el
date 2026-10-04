@@ -3,7 +3,7 @@
 ;; Author: sam kleinman <sam@tychoish.com>
 ;; Maintainer: sam kleinman <sam@tychoish.com>
 ;; Version: 0.1.0
-;; Package-Requires: ((emacs "29.1") (denote "3.0.0") (annotated-completing-read "0.1.0"))
+;; Package-Requires: ((emacs "29.1") (denote "3.0.0") (annotated-completing-read "0.1.0") (ox-gfm "20231215.1901"))
 ;; Keywords: docs, notion, denote, tools
 ;; URL: https://github.com/tychoish/denote-notion
 
@@ -248,7 +248,13 @@ must already be visited or is visited (and saved) as part of this call."
     (string-trim (buffer-substring-no-properties (point) (point-max)))))
 
 (defun denote-notion--org-to-markdown (org-body)
-  "Convert ORG-BODY (a string of Org markup) to Markdown via `ox-md'.
+  "Convert ORG-BODY (a string of Org markup) to Markdown via `ox-gfm'.
+`ox-gfm' (rather than plain `ox-md') is used so that Org tables export
+as GFM pipe tables and src blocks export as fenced \"```\" blocks --
+`ox-md' has no Markdown table transcoder at all and always falls back
+to raw HTML tables, and renders src blocks as 4-space-indented blocks
+instead of fenced ones, neither of which round-trips cleanly through
+Notion.
 Shadows `denote-link-ol-export' for the dynamic extent of the export
 call only, so an Org-source `denote:' link exports to the same
 intermediate Markdown shape a Markdown source has natively --
@@ -259,7 +265,7 @@ automatically, even on a non-local exit, without mutating the global
 link-type registry.  The export's `:with-toc' option is disabled so a
 spurious \"Table of Contents\" heading is never injected into the
 exported body."
-  (require 'ox-md)
+  (require 'ox-gfm)
   (with-temp-buffer
     (insert org-body)
     (org-mode)
@@ -269,7 +275,7 @@ exported body."
                         (pcase-let ((`(,_path ,query ,_search)
                                      (denote-link--ol-resolve-link-to-target link :full-data)))
                           (format "[%s](denote:%s)" description query)))))
-             (org-export-to-buffer 'md (generate-new-buffer-name "*denote-notion-md*")
+             (org-export-to-buffer 'gfm (generate-new-buffer-name "*denote-notion-md*")
                                     nil nil nil nil '(:with-toc nil)))))
       (unwind-protect
           (with-current-buffer md-buffer
@@ -689,18 +695,37 @@ Every separate Notion block (a paragraph, a heading, a list item, ...) is
 joined to the next by a single newline in `ntn's Markdown, with no blank
 line between them; a single newline is not a paragraph break in Markdown,
 so without widening it every block runs into the next as one paragraph.
-Each single newline is widened to a blank line first, then a literal
-\"<br>\" tag — Notion's *soft* line break within one block — is turned
-into a single newline, so it does not also become a paragraph break.
-Any literal square bracket in prose is also backslash-escaped (\\[, \\])
+Fenced \"```\" code blocks are pulled out and swapped back in verbatim
+around that widening, since their internal single newlines are
+meaningful code line breaks rather than block joins -- widening them
+too would blank-line-separate every line of code.  Each remaining
+single newline is widened to a blank line, then a literal \"<br>\" tag
+— Notion's *soft* line break within one block — is turned into a
+single newline, so it does not also become a paragraph break.  Any
+literal square bracket in prose is also backslash-escaped (\\[, \\])
 per CommonMark convention, to stop it from being misread as link syntax
 by a Markdown parser; a denote note is not read through one, so the
 escaping only pollutes prose that never had it in Notion's own editor."
-  (thread-last body
-               (replace-regexp-in-string "\n" "\n\n")
-               (replace-regexp-in-string "<br[ \t]*/?>" "\n")
-               (replace-regexp-in-string (regexp-quote "\\[") "[")
-               (replace-regexp-in-string (regexp-quote "\\]") "]")))
+  (let (fences)
+    (setq body (replace-regexp-in-string
+                "```[^\n]*\n\\(?:.\\|\n\\)*?\n```"
+                (lambda (match)
+                  (let ((idx (length fences)))
+                    (push match fences)
+                    (format "\0%d\0" idx)))
+                body))
+    (setq fences (vconcat (nreverse fences)))
+    (setq body (thread-last body
+                             (replace-regexp-in-string "\n" "\n\n")
+                             (replace-regexp-in-string "<br[ \t]*/?>" "\n")
+                             (replace-regexp-in-string (regexp-quote "\\[") "[")
+                             (replace-regexp-in-string (regexp-quote "\\]") "]")))
+    (replace-regexp-in-string
+     "\0\\([0-9]+\\)\0"
+     (lambda (match)
+       (string-match "\0\\([0-9]+\\)\0" match)
+       (aref fences (string-to-number (match-string 1 match))))
+     body)))
 
 (defun denote-notion--rich-text-plain (rich-text-array)
   "Return the concatenated `plain_text' of RICH-TEXT-ARRAY.
