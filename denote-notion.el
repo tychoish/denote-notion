@@ -3,7 +3,7 @@
 ;; Author: sam kleinman <sam@tychoish.com>
 ;; Maintainer: sam kleinman <sam@tychoish.com>
 ;; Version: 0.1.0
-;; Package-Requires: ((emacs "29.1") (denote "3.0.0") (annotated-completing-read "0.1.0") (ox-gfm "20231215.1901"))
+;; Package-Requires: ((emacs "29.1") (denote "3.0.0") (annotated-completing-read "0.1.0") (ox-gfm "20231215.1901") (gen "0.1.0"))
 ;; Keywords: docs, notion, denote, tools
 ;; URL: https://github.com/tychoish/denote-notion
 
@@ -25,14 +25,22 @@
 (require 'map)
 (require 'json)
 (require 'cl-lib)
+(require 'generator)
 (require 'denote)
 
 (require 'annotated-completing-read)
+(require 'gen)
 
 (declare-function org-export-to-buffer "ox")
 (declare-function denote-dash--file-at-point "denote-dash")
 (declare-function denote-dash-file-at-point "denote-dash") ;; future proof
 (declare-function denote-sequence-hierarchy-find-file "denote-sequence")
+(declare-function denote-dash-open-view "denote-dash")
+(declare-function denote-dash-refresh "denote-dash")
+(declare-function make-denote-dash-view "denote-dash")
+(declare-function denote-dash-view-name "denote-dash")
+(declare-function denote-dash--view-buffer-name "denote-dash")
+(defvar denote-dash-saved-views)
 
 (defun denote-notion--file-at-point ()
   "Return the denote file implied by the current point/buffer context, or nil.
@@ -83,6 +91,18 @@ per-machine, e.g. in casap.el for a personal workspace."
                                     (alist :key-type symbol :value-type sexp)))
   :group 'denote-notion)
 
+(defcustom denote-notion-cache-directory
+  (expand-file-name "denote-notion-cache/" user-emacs-directory)
+  "Directory holding last-synced Notion page body snapshots, one file per id.
+Deliberately outside `denote-directory' (or any of its subdirectories) --
+Denote itself, and tooling like `denote-dash'/`denote-sequence', scan
+every file under the denote directory as a candidate note; a cache
+snapshot of a Notion page's last-synced content is not itself a note
+and must never show up in a listing, tag search, or sequence hierarchy
+alongside real notes."
+  :type 'directory
+  :group 'denote-notion)
+
 (defcustom denote-notion-export-auto-push-linked-notes nil
   "When non-nil, auto-push untracked `denote:'-linked note before fallback.
 A `denote:' link found while exporting a note's body (see
@@ -92,6 +112,21 @@ not-yet-Notion-tracked note is, when this is non-nil, pushed first (via
 Notion URL; when nil (the default), such a link always falls back to
 plain text instead, exactly as it did before this option existed."
   :type 'boolean
+  :group 'denote-notion)
+
+(defcustom denote-notion-batch-max-concurrent-processes 4
+  "Max number of concurrent `ntn' subprocesses `denote-notion-sync-all' runs.
+Each tracked note's sync costs at least one, and sometimes two, `ntn'
+invocations (see `denote-notion--sync-all-process-note'); running every
+tracked note's invocations one after another, blocking, is exactly the
+behavior `denote-notion-sync-all' exists to avoid, but running every
+note's `ntn' subprocess at once would still spike CPU/network and Node
+startup overhead across however many notes happen to be tracked.  This
+bounds how many notes are ever mid-sync at the same time; a small
+number (the default, 4) keeps Emacs responsive and avoids saturating a
+single machine's network connection or CPU, without serializing the
+whole batch down to one note at a time."
+  :type 'natnum
   :group 'denote-notion)
 
 (defun denote-notion--parent-arg (parent)
@@ -188,6 +223,65 @@ non-zero."
                   (if (string-empty-p stderr) stdout stderr)))
     (json-parse-string stdout :object-type 'alist :array-type 'list)))
 
+(defun denote-notion--run-async (args callback)
+  "Async sibling of `denote-notion--run'; run \"npx ntn\" ARGS via `make-process'.
+Preserves the same stdout/stderr separation `denote-notion--run' relies
+on -- see that function's docstring for why mixing npm's stderr
+progress-notice lines into stdout corrupts JSON parsing -- but via
+`make-process''s own `:stderr' keyword (which, given a buffer rather
+than nil, spins up a second, associated pipe process so stderr never
+lands in the stdout buffer/filter) rather than a stderr tempfile, since
+`make-process' has no temp-file destination option the way
+`call-process' does.
+
+CALLBACK is invoked, once the process has exited, as
+\(CALLBACK EXIT-CODE STDOUT STDERR\) -- the same three values
+`denote-notion--run' returns as a list, just passed positionally here so
+an async call site reads symmetrically with a `pcase-let' destructure of
+the synchronous call's return value."
+  (let* ((stdout-buffer (generate-new-buffer " *denote-notion-ntn-stdout*"))
+         (stderr-buffer (generate-new-buffer " *denote-notion-ntn-stderr*")))
+    (make-process
+     :name "denote-notion-ntn"
+     :buffer stdout-buffer
+     :stderr stderr-buffer
+     :command (append (list "npx" "ntn") args)
+     :noquery t
+     :sentinel
+     (lambda (proc _event)
+       (unless (process-live-p proc)
+         (let ((exit-code (process-exit-status proc))
+               (stdout (with-current-buffer stdout-buffer (buffer-string)))
+               (stderr (with-current-buffer stderr-buffer (buffer-string))))
+           (when (buffer-live-p stdout-buffer) (kill-buffer stdout-buffer))
+           (when (buffer-live-p stderr-buffer) (kill-buffer stderr-buffer))
+           (funcall callback exit-code stdout stderr)))))))
+
+(defun denote-notion--run-json-async (args callback)
+  "Async sibling of `denote-notion--run-json'; parse \"npx ntn\" ARGS's JSON.
+Unlike `denote-notion--run-json', never signals a `user-error' on a
+non-zero exit code -- an error signaled from inside a process sentinel
+has no synchronous caller above it to propagate to; Emacs would merely
+log it via its own \"error in process sentinel\" handler and move on,
+silently dropping whatever the caller meant to do with the failure.
+Instead CALLBACK is invoked as \(CALLBACK ERROR RESULT\): ERROR is nil on
+success and RESULT holds the parsed JSON alist; on a non-zero exit, ERROR
+is a string carrying the same message `denote-notion--run-json' would
+have raised in a `user-error', and RESULT is nil.  This lets
+`denote-notion-sync-all''s batch dispatcher treat one note's failure as
+data to record in its summary, rather than a signal with nowhere to go."
+  (let ((args (if (equal (car args) "api") args (append args '("--json")))))
+    (denote-notion--run-async
+     args
+     (lambda (exit-code stdout stderr)
+       (denote-notion--debug-log args stdout stderr)
+       (if (zerop exit-code)
+           (funcall callback nil (json-parse-string stdout :object-type 'alist :array-type 'list))
+         (funcall callback
+                  (format "ntn %s failed: %s" (string-join args " ")
+                          (if (string-empty-p stderr) stdout stderr))
+                  nil))))))
+
 ;;; Front matter get/set
 
 (defun denote-notion--frontmatter-line-regexp (key)
@@ -228,6 +322,19 @@ must already be visited or is visited (and saved) as part of this call."
   "Return non-nil if FILE has a non-empty notion_id front-matter value."
   (let ((id (denote-notion--frontmatter-get file "notion_id")))
     (and id (not (string-empty-p id)) (not (string= id "\"\"")))))
+
+(defun denote-notion--conflicted-p (file)
+  "Return non-nil if FILE is marked `notion_conflict'.
+See `denote-notion--export-update', which sets this flag.
+Mirrors `denote-notion--tracked-p''s shape, except the truthy value
+written here is the bare symbol `t' (formatted as the string \"t\" by
+`denote-notion--frontmatter-format-value', not a quoted string) -- so a
+present-but-falsy value (the field cleared to the empty string by
+`denote-notion--finish-conflict-resolution') must be distinguished from
+\"set to t\", not merely from \"absent\", the way `--tracked-p' only
+needs to tell apart."
+  (let ((value (denote-notion--frontmatter-get file "notion_conflict")))
+    (and value (string= value "t"))))
 
 ;;; Body extraction and conversion
 
@@ -387,6 +494,174 @@ in the order encountered."
            body)))
     (cons rewritten (nreverse dangling))))
 
+;;; Change detection: content cache and sync-state classification
+
+(defun denote-notion--cache-file-for (notion-id)
+  "Return the absolute path of NOTION-ID's cache file.
+Creates `denote-notion-cache-directory' on demand if it does not yet
+exist, so the first write (or even a probing read) never has to worry
+about a missing parent directory.  The file is named after NOTION-ID
+verbatim and carries no extension -- a Notion page id is already a bare
+hex/dash string, safe to use directly as a filename, and nothing but
+`denote-notion--cache-read'/`denote-notion--cache-write' ever opens it,
+so there is no reader that benefits from a recognizable suffix."
+  (unless (file-directory-p denote-notion-cache-directory)
+    (make-directory denote-notion-cache-directory t))
+  (expand-file-name notion-id denote-notion-cache-directory))
+
+(defun denote-notion--cache-read (notion-id)
+  "Return NOTION-ID's cached last-synced Markdown body, or nil if none yet.
+A missing cache file is not an error -- it is exactly the \"no ancestor
+exists yet\" case a caller (e.g. the conflict-resolution task's planned
+three-way merge) needs to tell apart from \"an ancestor exists but is
+empty\"; signaling here would make that distinction impossible to make
+cleanly at the call site."
+  (let ((cache-file (denote-notion--cache-file-for notion-id)))
+    (when (file-exists-p cache-file)
+      (with-temp-buffer
+        (insert-file-contents cache-file)
+        (buffer-string)))))
+
+(defun denote-notion--cache-write (notion-id content)
+  "Write CONTENT as NOTION-ID's cached last-synced Markdown body.
+Unconditionally overwrites any cache file already on disk for NOTION-ID
+-- the cache only ever needs to remember the single most recent
+exchange with Notion, not a history of every past one."
+  (with-temp-file (denote-notion--cache-file-for notion-id)
+    (insert content)))
+
+(defun denote-notion--content-hash (content)
+  "Return a content hash of CONTENT, for sync-state change detection.
+A thin wrapper around `secure-hash' (SHA-1) -- this exists so call
+sites read as \"the content hash\" rather than a bare `secure-hash' call
+with its algorithm argument repeated at every site, and so the
+algorithm itself is swappable in this one place alone, should SHA-1
+ever need to change."
+  (secure-hash 'sha1 content))
+
+(defun denote-notion--classify-sync-state (local-changed-p remote-changed-p)
+  "Pure classification rule shared by the sync and async sync-state paths.
+Given LOCAL-CHANGED-P and REMOTE-CHANGED-P (each already computed, by
+whatever means -- synchronously in `denote-notion--sync-state', or via
+`denote-notion--run-json-async' in `denote-notion--sync-state-async'),
+returns the same `unchanged'/`local-only'/`remote-only'/`both-changed'
+symbol either caller would have inlined into its own `cond' -- factored
+out here once so the batch-sync task's async path does not duplicate
+these four rules a second time alongside the original."
+  (cond
+   ((and local-changed-p remote-changed-p) 'both-changed)
+   (local-changed-p 'local-only)
+   (remote-changed-p 'remote-only)
+   (t 'unchanged)))
+
+(defun denote-notion--sync-state (file)
+  "Classify FILE's sync state relative to its already-tracked Notion page.
+FILE must be Notion-tracked (see `denote-notion--tracked-p'); signals a
+`user-error' otherwise -- this is a programming-error guard, not a
+user-facing check, since every caller is expected to have already
+filtered to tracked files before reaching here.
+
+Returns one of the symbols:
+- `unchanged' -- neither side has moved since the last recorded sync.
+- `local-only' -- FILE's own exportable body has changed (its content
+  hash no longer matches the stored `notion_sync_hash'), but the
+  remote page has not.
+- `remote-only' -- the remote page's `last_edited_time' has advanced
+  past the stored `notion_edited', but FILE's local body is unchanged.
+- `both-changed' -- both sides have moved -- the conflict a push or
+  pull must not silently resolve one way or the other.
+
+Local change is detected by content hash, not by a file modification
+timestamp -- FILE's own Denote front matter (tags, signature, any other
+metadata) changes far more often than its actual exportable body does,
+so an mtime check would false-positive on nearly every edit.  A missing
+or empty stored `notion_sync_hash' (a note that predates this field, or
+one whose last sync somehow never recorded it) is treated as
+local-changed -- the conservative default for \"nothing has been
+recorded as synced yet\".
+
+Remote change is detected from a single `pages get' call's
+`last_edited_time' alone, compared against the stored `notion_edited'
+the same way `denote-notion--export-update' always has (`string>' on
+the raw ISO-8601 timestamps means newer, since they sort lexically):
+this function makes exactly one remote request in total, so
+that the (not-yet-built) batch-sync task can call it once per tracked
+note without multiplying network calls across a whole directory.  When
+the timestamp alone already proves the remote side is unchanged, the
+remote page's Markdown body is never fetched or hashed at all; when the
+timestamp has advanced, remote-changed-p is simply set to t --
+distinguishing a genuine content edit on Notion's side from a cosmetic
+property-only edit is not something this classification promises, and
+would require a second fetch this function is designed to avoid."
+  (unless (denote-notion--tracked-p file)
+    (user-error "File is not Notion-tracked: %s" file))
+  (let* ((id (string-trim (denote-notion--frontmatter-get file "notion_id") "\"" "\""))
+         (stored-hash (string-trim (or (denote-notion--frontmatter-get file "notion_sync_hash") "") "\"" "\""))
+         (stored-edited (string-trim (or (denote-notion--frontmatter-get file "notion_edited") "") "\"" "\""))
+         (local-hash (denote-notion--content-hash (car (denote-notion--export-body file))))
+         (local-changed-p (or (string-empty-p stored-hash) (not (equal local-hash stored-hash))))
+         (remote (map-elt (denote-notion--run-json (list "pages" "get" id)) 'page))
+         (remote-edited (map-elt remote 'last_edited_time))
+         (remote-changed-p (and remote-edited stored-edited
+                                 (not (string-empty-p stored-edited))
+                                 (string> remote-edited stored-edited))))
+    (denote-notion--classify-sync-state local-changed-p remote-changed-p)))
+
+(defun denote-notion--sync-state-async (file callback)
+  "Async sibling of `denote-notion--sync-state'; see it for the full rules.
+Only the one remote `pages get' call `denote-notion--sync-state' makes is
+async here -- FILE's own local content hash is already a purely local,
+fast computation, so it still runs synchronously up front, exactly as in
+the synchronous original; sharing `denote-notion--classify-sync-state'
+for the actual classification rule means those four rules
+\(unchanged/local-only/remote-only/both-changed\) are never duplicated
+between this and `denote-notion--sync-state'.
+
+This exists because `denote-notion--sync-state' as written cannot be
+reused as-is inside `denote-notion-sync-all''s concurrent pool: its one
+remote call is a blocking `denote-notion--run-json', and calling it once
+per tracked note, one after another, would reintroduce the exact
+serial-blocking problem batch sync exists to avoid -- the classification
+step itself has to be part of the concurrent pool, not a serial
+pre-pass before it.
+
+CALLBACK is invoked as \(CALLBACK ERROR STATE\): ERROR non-nil (and STATE
+nil\) on an `ntn' failure, mirroring `denote-notion--run-json-async';
+otherwise ERROR is nil and STATE is the classification symbol."
+  (unless (denote-notion--tracked-p file)
+    (user-error "File is not Notion-tracked: %s" file))
+  (let* ((id (string-trim (denote-notion--frontmatter-get file "notion_id") "\"" "\""))
+         (stored-hash (string-trim (or (denote-notion--frontmatter-get file "notion_sync_hash") "") "\"" "\""))
+         (stored-edited (string-trim (or (denote-notion--frontmatter-get file "notion_edited") "") "\"" "\""))
+         (local-hash (denote-notion--content-hash (car (denote-notion--export-body file))))
+         (local-changed-p (or (string-empty-p stored-hash) (not (equal local-hash stored-hash)))))
+    (denote-notion--run-json-async
+     (list "pages" "get" id)
+     (lambda (error result)
+       (if error
+           (funcall callback error nil)
+         (let* ((remote (map-elt result 'page))
+                (remote-edited (map-elt remote 'last_edited_time))
+                (remote-changed-p (and remote-edited stored-edited
+                                        (not (string-empty-p stored-edited))
+                                        (string> remote-edited stored-edited))))
+           (funcall callback nil (denote-notion--classify-sync-state local-changed-p remote-changed-p))))))))
+
+(defun denote-notion--record-synced-content (file notion-id content)
+  "Record CONTENT as the body last exchanged with FILE's Notion page NOTION-ID.
+Writes FILE's `notion_sync_hash' front-matter field (see
+`denote-notion--content-hash') and CONTENT itself to NOTION-ID's
+on-disk cache (see `denote-notion--cache-write'), together, so a later
+`denote-notion--sync-state' call can tell that FILE's own body has not
+moved since this exchange, and so the conflict-resolution task's
+planned three-way merge has an ancestor to diff against.  Kept as one
+function, called identically from `denote-notion--export-create',
+`denote-notion--export-update', and `denote-notion--import-refresh-file',
+rather than duplicating both writes by hand at each of those three call
+sites, where they could drift out of sync with each other."
+  (denote-notion--frontmatter-set file "notion_sync_hash" (denote-notion--content-hash content))
+  (denote-notion--cache-write notion-id content))
+
 ;;; Export
 
 (defun denote-notion--read-parent ()
@@ -544,6 +819,7 @@ Returns a cons (URL . DANGLING-LINKS); see `denote-notion--export-body'."
         (denote-notion--frontmatter-set file "notion_created" (map-elt page 'created_time))
         (denote-notion--frontmatter-set file "notion_edited" (map-elt page 'last_edited_time))
         (denote-notion--frontmatter-set file "notion_parent" (denote-notion--parent-arg parent))
+        (denote-notion--record-synced-content file (map-elt page 'id) content)
         (denote-notion--set-tags-from-properties file (map-elt page 'properties))
         (denote-notion--set-page-title (map-elt page 'id) (map-elt page 'properties)
                                         (denote-notion--export-title file))
@@ -554,41 +830,126 @@ Returns a cons (URL . DANGLING-LINKS); see `denote-notion--export-body'."
                                            denote-notion--default-export-properties))
         (cons (map-elt page 'url) dangling)))))
 
+(defun denote-notion--export-apply-pushed-page (file id content dangling page)
+  "Apply post-edit bookkeeping to FILE/ID once CONTENT has been pushed to PAGE.
+PAGE is the full page object re-fetched via `pages get' after a `pages
+edit' call -- `ntn pages edit --json' itself returns only a minimal
+confirmation object, with neither `url' nor `properties', so both
+`denote-notion--export-update''s FORCE path and its async sibling
+`denote-notion--export-push-async' re-fetch PAGE the same way before
+calling this.  Records FILE's `notion_edited' and synced-content cache
+entry (see `denote-notion--record-synced-content'), sets the discovered
+title property, and PATCHes any configured Notion properties -- the four
+steps both callers would otherwise duplicate in full, mirroring how
+`denote-notion--import-apply-refresh' already factors the equivalent
+steps on the import side.
+Returns a cons (URL . DANGLING-LINKS); DANGLING-LINKS is passed through
+unchanged from CONTENT's own `denote-notion--export-body' call."
+  (let* ((stored-parent (string-trim (or (denote-notion--frontmatter-get file "notion_parent") "") "\"" "\""))
+         (registry-entry (denote-notion--registry-entry-for-parent
+                           (denote-notion--parse-parent-arg stored-parent)))
+         (default-properties (cdr (cdr registry-entry))))
+    (denote-notion--frontmatter-set file "notion_edited" (map-elt page 'last_edited_time))
+    (denote-notion--record-synced-content file id content)
+    (denote-notion--set-page-title id (map-elt page 'properties) (denote-notion--export-title file))
+    (denote-notion--apply-properties
+     id (denote-notion--merge-properties (denote-notion--export-properties file) default-properties))
+    (cons (map-elt page 'url) dangling)))
+
 (defun denote-notion--export-update (file force)
   "Update the Notion page already tracked by FILE, or signal a conflict.
-With FORCE non-nil, overwrite the remote page without comparing timestamps.
+With FORCE non-nil, overwrite the remote page unconditionally, skipping
+`denote-notion--sync-state' (and its remote fetch) entirely.
+
+Without FORCE, `denote-notion--sync-state' classifies FILE first:
+- `unchanged' -- the network edit is skipped outright (no `ntn pages
+  edit' call at all), and a message reports the file is already in
+  sync; the previously-fetched URL (reconstructed from NOTION_ID,
+  not re-fetched) is returned as if a push had happened, so callers
+  like `denote-notion-push' can report it uniformly either way.
+- `both-changed' -- rather than erroring, FILE's `notion_conflict'
+  front-matter flag is set to `t' (see `denote-notion--conflicted-p')
+  and the network edit is skipped outright, exactly like `unchanged'
+  below -- the caller is not blocked, just told (via the returned URL
+  and a message) that nothing was pushed and that
+  `denote-notion-resolve-conflict' is how to reconcile the two sides
+  by hand. This replaces this function's previous behavior of raising a
+  `user-error' on `both-changed' unconditionally.
+- `local-only' or `remote-only' -- the update proceeds exactly as
+  before FORCE existed; this function does not attempt to protect a
+  `remote-only' push from clobbering content that changed on the
+  Notion side alone, same as its behavior prior to this change.
 
 Unlike `ntn pages create --json' (a flat page object with `url',
 `properties', `last_edited_time', etc.), `ntn pages edit --json' returns
 only a minimal confirmation object — id/markdown/object/request_id/
-truncated/unknown_block_ids, no `url' or `properties' — so everything
-below the content edit re-fetches the full page object via `pages get'
-rather than reading it from the edit response.
+truncated/unknown_block_ids, no `url' or `properties' — so the FORCE
+branch re-fetches the full page object via `pages get' and hands it to
+`denote-notion--export-apply-pushed-page' rather than reading it from
+the edit response.
 
 Returns a cons (URL . DANGLING-LINKS); see `denote-notion--export-body'."
+  (let* ((id (string-trim (denote-notion--frontmatter-get file "notion_id") "\"" "\""))
+         (state (unless force (denote-notion--sync-state file))))
+    (when (eq state 'both-changed)
+      (denote-notion--frontmatter-set file "notion_conflict" t)
+      (message
+       "Notion page %s changed since the last sync (remote and local both changed); marked notion_conflict -- run `denote-notion-resolve-conflict' to reconcile"
+       id))
+    (if (memq state '(unchanged both-changed))
+        (progn
+          (unless (eq state 'both-changed)
+            (message "Notion page %s already in sync; nothing to push" id))
+          (cons (format "https://www.notion.so/%s" (string-replace "-" "" id)) nil))
+      (pcase-let ((`(,content . ,dangling) (denote-notion--export-body file)))
+        (denote-notion--run-json (list "pages" "edit" id "--content" content))
+        (let ((page (map-elt (denote-notion--run-json (list "pages" "get" id)) 'page)))
+          (denote-notion--export-apply-pushed-page file id content dangling page))))))
+
+(defun denote-notion--export-push-async (file callback)
+  "Async, state-already-known push of FILE's content to its tracked page.
+The async counterpart to `denote-notion--export-update' called with
+FORCE non-nil -- it never computes or re-checks
+`denote-notion--sync-state'/`denote-notion--sync-state-async' itself.
+Built for `denote-notion-sync-all', which has already classified FILE as
+`local-only' via exactly one async `pages get' call
+\(`denote-notion--sync-state-async'\) before deciding to push; re-deriving
+sync-state again in here, the way a plain non-FORCE
+`denote-notion--export-update' call would, means a second, redundant
+remote fetch for every `local-only' note in a batch run.
+
+Mirrors `denote-notion--export-update''s FORCE branch step for step: edit
+the page's content, then re-fetch the page to pick up its now-updated
+`last_edited_time' and `properties' \(`ntn pages edit --json' does not
+return either\), and apply the fetched page via the same
+`denote-notion--export-apply-pushed-page' helper that branch uses --
+including its final properties PATCH, which still runs synchronously via
+`denote-notion--run-json' even from this otherwise-async function: it is
+a small, independent PATCH already conditioned on FILE actually
+declaring properties to apply, not the expensive per-note call this
+function exists to make concurrent, so leaving it synchronous here was
+judged an acceptable, documented trade-off rather than something
+requiring its own async sibling.
+
+CALLBACK is invoked as \(CALLBACK ERROR URL-AND-DANGLING\), mirroring
+`denote-notion--run-json-async''s shape; URL-AND-DANGLING is the same
+\(URL . DANGLING-LINKS\) cons `denote-notion--export-update' returns, nil
+on error."
   (let ((id (string-trim (denote-notion--frontmatter-get file "notion_id") "\"" "\"")))
-    (unless force
-      (let* ((remote (map-elt (denote-notion--run-json (list "pages" "get" id)) 'page))
-             (remote-edited (map-elt remote 'last_edited_time))
-             (stored-edited (string-trim (or (denote-notion--frontmatter-get file "notion_edited") "") "\"" "\"")))
-        (when (and remote-edited stored-edited
-                   (not (string-empty-p stored-edited))
-                   (string> remote-edited stored-edited))
-          (user-error
-           "Notion page %s changed since the last sync (remote %s > stored %s); run `denote-notion-pull' (with no page id, to dwim-refresh) first, or pass force"
-           id remote-edited stored-edited))))
     (pcase-let ((`(,content . ,dangling) (denote-notion--export-body file)))
-      (denote-notion--run-json (list "pages" "edit" id "--content" content))
-      (let* ((page (map-elt (denote-notion--run-json (list "pages" "get" id)) 'page))
-             (stored-parent (string-trim (or (denote-notion--frontmatter-get file "notion_parent") "") "\"" "\""))
-             (registry-entry (denote-notion--registry-entry-for-parent
-                               (denote-notion--parse-parent-arg stored-parent)))
-             (default-properties (cdr (cdr registry-entry))))
-        (denote-notion--frontmatter-set file "notion_edited" (map-elt page 'last_edited_time))
-        (denote-notion--set-page-title id (map-elt page 'properties) (denote-notion--export-title file))
-        (denote-notion--apply-properties
-         id (denote-notion--merge-properties (denote-notion--export-properties file) default-properties))
-        (cons (map-elt page 'url) dangling)))))
+      (denote-notion--run-json-async
+       (list "pages" "edit" id "--content" content)
+       (lambda (error _result)
+         (if error
+             (funcall callback error nil)
+           (denote-notion--run-json-async
+            (list "pages" "get" id)
+            (lambda (error2 result2)
+              (if error2
+                  (funcall callback error2 nil)
+                (funcall callback nil
+                         (denote-notion--export-apply-pushed-page
+                          file id content dangling (map-elt result2 'page))))))))))))
 
 ;;;###autoload
 (defun denote-notion-push (&optional file parent force)
@@ -613,6 +974,132 @@ that failed to resolve to a Notion page."
                      (denote-notion--export-create file (or parent (denote-notion--read-parent))))))
         (message "Exported to %s" url)
         (denote-notion--report-dangling-links dangling)))))
+
+;;; Conflict resolution
+
+(require 'ediff)
+
+(defun denote-notion--finish-conflict-resolution (file merged-content)
+  "Write MERGED-CONTENT back into FILE, clear its conflict flag, and force-push.
+Called once a human has resolved a `notion_conflict' note's three-way (or,
+absent an ancestor, two-way) merge -- see `denote-notion-resolve-conflict' --
+with MERGED-CONTENT the finished merge buffer's text.
+
+Writes MERGED-CONTENT as FILE's body via `denote-notion--import-write-body'
+(the same helper `denote-notion--import-refresh-file' already uses), then
+clears `notion_conflict' by setting it to the empty string rather than
+removing the front-matter line outright -- `denote-notion--frontmatter-set'
+has no \"remove a key\" mode, and passing it nil would format as the
+literal, meaningless text \"nil\" (`denote-notion--frontmatter-format-value'
+applies `%S' indiscriminately to any non-list value); an empty string
+formats as the already-unambiguous `\"\"', the same way a cleared
+`notion_id' line reads as untracked to `denote-notion--tracked-p'.
+
+Finally pushes FILE to Notion with FORCE unconditionally true.  A plain
+\(non-forced\) push here would recompute `denote-notion--sync-state' and,
+since the remote page's `last_edited_time' has not advanced from this
+process's point of view since the conflict was first detected, would
+likely re-classify the push as `both-changed' all over again -- the user
+has just manually reconciled both sides by hand, so forcing is the
+correct and deliberate choice, not a shortcut around the conflict check."
+  (denote-notion--import-write-body file merged-content)
+  (denote-notion--frontmatter-set file "notion_conflict" "")
+  (denote-notion-push file nil t))
+
+(defun denote-notion--build-conflict-buffers (file notion-id)
+  "Return a plist of buffers for FILE's three-way (or two-way) conflict merge.
+Keys `:local', `:remote', `:ancestor' hold freshly created buffers
+populated with, respectively: FILE's current exportable body (see
+`denote-notion--export-body'), NOTION-ID's current remote Markdown body
+\(fetched fresh via `ntn pages get', the same nested `markdown' shape
+`denote-notion--import-refresh-file' already unwraps\), and NOTION-ID's
+cached last-synced body (see `denote-notion--cache-read') -- `:ancestor'
+is nil, not a buffer, when no cache entry exists yet (a note tracked
+before the change-detection task landed), so the caller can tell
+\"use the three-way merge\" apart from \"fall back to a two-way one\"."
+  (let* ((local-content (car (denote-notion--export-body file)))
+         (remote-result (denote-notion--run-json (list "pages" "get" notion-id)))
+         (remote-content (denote-notion--clean-imported-body
+                           (map-elt (map-elt remote-result 'markdown) 'markdown)))
+         (ancestor-content (denote-notion--cache-read notion-id))
+         (local-buffer (generate-new-buffer (format "*denote-notion-conflict-local-%s*" notion-id)))
+         (remote-buffer (generate-new-buffer (format "*denote-notion-conflict-remote-%s*" notion-id)))
+         (ancestor-buffer (and ancestor-content
+                                (generate-new-buffer
+                                 (format "*denote-notion-conflict-ancestor-%s*" notion-id)))))
+    (with-current-buffer local-buffer (insert local-content))
+    (with-current-buffer remote-buffer (insert remote-content))
+    (when ancestor-buffer
+      (with-current-buffer ancestor-buffer (insert ancestor-content)))
+    (list :local local-buffer :remote remote-buffer :ancestor ancestor-buffer)))
+
+;;;###autoload
+(defun denote-notion-resolve-conflict (&optional file)
+  "Interactively resolve FILE's `notion_conflict' via an ediff merge session.
+FILE defaults to `denote-notion--file-at-point', erroring (matching
+`denote-notion-push''s own style) when there is none.  FILE must already
+be Notion-tracked and marked conflicted (see `denote-notion--tracked-p'
+and `denote-notion--conflicted-p'); either condition missing is a
+`user-error', not silently a no-op.
+
+Builds three in-memory buffers (see
+`denote-notion--build-conflict-buffers'): FILE's own current exportable
+body, NOTION-ID's current remote body (fetched fresh, not from the
+sync-state check that flagged the conflict), and the cached last-synced
+ancestor body, if one exists.  When an ancestor exists, starts
+`ediff-merge-buffers-with-ancestor' -- a genuine three-way merge that
+auto-resolves every region only one side touched, dropping the user into
+an interactive session only for the regions both sides touched
+differently.  When no ancestor exists (a note tracked before the
+change-detection task introduced the cache, so no prior snapshot was
+ever recorded), falls back to a plain two-way `ediff-buffers' comparing
+local against remote directly -- the documented degraded path for that
+case, not a silent behavior change.
+
+The merge's finish action is wired via a buffer-local addition to
+`ediff-quit-hook' inside the ediff control buffer, added immediately
+after the session starts -- `ediff-quit-hook' is otherwise a single
+global hook list shared by every ediff session in the Emacs instance, so
+a plain `add-hook' without the LOCAL argument would also fire (and,
+worse, persist) across any other, unrelated ediff session the user
+might start before or after this one; the buffer-local form scopes the
+action to this one session only, and the hook function kills the three
+scratch buffers itself before ediff discards its own (buffer-local)
+control buffer, so nothing leaks past this one merge."
+  (interactive)
+  (let* ((file (or file (denote-notion--file-at-point) (user-error "No file to resolve")))
+         (_ (unless (denote-notion--tracked-p file)
+              (user-error "File is not Notion-tracked: %s" file)))
+         (_ (unless (denote-notion--conflicted-p file)
+              (user-error "File has no notion_conflict to resolve: %s" file)))
+         (notion-id (string-trim (denote-notion--frontmatter-get file "notion_id") "\"" "\""))
+         (buffers (denote-notion--build-conflict-buffers file notion-id))
+         (local-buffer (plist-get buffers :local))
+         (remote-buffer (plist-get buffers :remote))
+         (ancestor-buffer (plist-get buffers :ancestor))
+         (cleanup
+          (lambda ()
+            (dolist (buf (list local-buffer remote-buffer ancestor-buffer))
+              (when (buffer-live-p buf) (kill-buffer buf)))))
+         (finish
+          (lambda ()
+            ;; A three-way session (ancestor present) produces a dedicated
+            ;; merge buffer at `ediff-buffer-C'.  The two-way fallback
+            ;; (`ediff-buffers', no ancestor) has no such buffer -- there,
+            ;; LOCAL-BUFFER is the one the user reconciles directly, via
+            ;; ediff's ordinary copy-hunk-A-to-B/B-to-A actions, so its
+            ;; final text is what gets written back.
+            (let ((merged (with-current-buffer (if ancestor-buffer ediff-buffer-C local-buffer)
+                            (buffer-string))))
+              (denote-notion--finish-conflict-resolution file merged))
+            (funcall cleanup))))
+    (if ancestor-buffer
+        (ediff-merge-buffers-with-ancestor
+         local-buffer remote-buffer ancestor-buffer
+         (list (lambda () (add-hook 'ediff-quit-hook finish nil t))))
+      (ediff-buffers
+       local-buffer remote-buffer
+       (list (lambda () (add-hook 'ediff-quit-hook finish nil t)))))))
 
 ;;; Registry maintenance
 
@@ -752,20 +1239,54 @@ RICH-TEXT-ARRAY is a Notion API rich_text array (as found in a `title' or
     (insert body "\n")
     (save-buffer)))
 
-(defun denote-notion--import-refresh-file (file page-id)
-  "Pull PAGE-ID's current content and tracking fields into FILE.
-Syncs `notion_tags' from the page's current Tags property.  denote's own
-title/keywords are left alone, matching how export treats them as
-user-owned once set."
-  (let* ((result (denote-notion--run-json (list "pages" "get" page-id)))
-         (page (map-elt result 'page))
-         ;; `ntn pages get --json' nests the markdown text under its own
-         ;; `markdown' object: {"markdown": {"markdown": "...", ...}, "page": {...}}.
+(defun denote-notion--import-apply-refresh (file page-id result)
+  "Apply a `pages get' RESULT to FILE, as a refresh of its tracked PAGE-ID.
+RESULT is the same shape `denote-notion--run-json' and
+`denote-notion--run-json-async' return for `pages get' -- `ntn pages get
+--json' nests the markdown text
+under its own `markdown' object: {\"markdown\": {\"markdown\": \"...\"},
+\"page\": {...}}.  Writes FILE's body, refreshes its `notion_edited' and
+synced-content cache, and syncs `notion_tags' from the page's current
+Tags property.  denote's own title/keywords are left alone, matching how
+export treats them as user-owned once set.
+
+Factored out of `denote-notion--import-refresh-file' so both it and its
+async sibling `denote-notion--import-refresh-file-async' (used by the
+batch-sync `remote-only' path) apply an already-fetched RESULT the same
+way, rather than duplicating these four steps between a sync and an
+async caller."
+  (let* ((page (map-elt result 'page))
          (body (denote-notion--clean-imported-body
                 (map-elt (map-elt result 'markdown) 'markdown))))
     (denote-notion--import-write-body file body)
     (denote-notion--frontmatter-set file "notion_edited" (map-elt page 'last_edited_time))
+    (denote-notion--record-synced-content file page-id body)
     (denote-notion--set-tags-from-properties file (map-elt page 'properties))))
+
+(defun denote-notion--import-refresh-file (file page-id)
+  "Pull PAGE-ID's current content and tracking fields into FILE.
+See `denote-notion--import-apply-refresh' for what is actually applied."
+  (denote-notion--import-apply-refresh
+   file page-id (denote-notion--run-json (list "pages" "get" page-id))))
+
+(defun denote-notion--import-refresh-file-async (file page-id callback)
+  "Async sibling of `denote-notion--import-refresh-file'.
+Built for `denote-notion-sync-all''s `remote-only' action, which has
+already classified FILE via `denote-notion--sync-state-async' before
+deciding to pull -- this still makes its own `pages get' call rather
+than reusing that classification call's result, since
+`denote-notion--sync-state' (and its async sibling) deliberately never
+fetches the remote body at all, only `last_edited_time' -- see
+`denote-notion--sync-state''s docstring.  CALLBACK is invoked as
+\(CALLBACK ERROR\): ERROR non-nil on an `ntn' failure
+\(see `denote-notion--run-json-async'\), nil on success."
+  (denote-notion--run-json-async
+   (list "pages" "get" page-id)
+   (lambda (error result)
+     (if error
+         (funcall callback error)
+       (denote-notion--import-apply-refresh file page-id result)
+       (funcall callback nil)))))
 
 (defun denote-notion--find-tracked-file (id)
   "Return the denote file already tracking Notion page ID, or nil.
@@ -849,6 +1370,387 @@ buffer directly, with no prompt at all."
               (denote-notion--frontmatter-set new-file "notion_edited" (map-elt page 'last_edited_time))
               (save-buffer)
               (message "Imported %s" (file-name-nondirectory new-file)))))))))
+
+;;; Denote-dash view helpers
+
+(defconst denote-notion--dash-view-tracked-name "notion: tracked"
+  "Name of the saved `denote-dash-view' registered by
+`denote-notion-dash-view-tracked'.")
+
+(defconst denote-notion--dash-view-conflicts-name "notion: conflicts"
+  "Name of the saved `denote-dash-view' registered by
+`denote-notion-dash-view-conflicts'.")
+
+(defconst denote-notion--dash-view-remote-updated-name "notion: remote-updated"
+  "Name of the saved `denote-dash-view' registered by
+`denote-notion-dash-view-remote-updated'.")
+
+(defun denote-notion--frontmatter-nonempty-value-regexp (key)
+  "Return a regexp matching a front-matter KEY line with a non-empty value.
+Mirrors `denote-notion--frontmatter-line-regexp''s KEY:VALUE line shape,
+but further anchored to require at least one non-quote character right
+after the value's opening quote -- every value this tool itself writes is
+quoted via `denote-notion--frontmatter-format-value', so an empty string
+always reads back as the literal two-character \"\\\"\\\"\", with a closing
+quote immediately following the opening one and nothing in between; this
+regexp excludes exactly that case, the same \"non-empty\" test
+`denote-notion--tracked-p' already applies via `string-empty-p' and a
+literal `\\\"\\\"' comparison, rewritten here as a content regexp because a
+`denote-dash' grep filter is exactly that -- a plain regexp matched
+against a whole file's content via `re-search-forward', not a predicate
+function call per file (see `denote-dash--file-grep-matches-p')."
+  (format "^%s:[ \t]*\"[^\"]" (regexp-quote key)))
+
+(defconst denote-notion--dash-conflict-grep-filter
+  "^notion_conflict:[ \t]*t[ \t]*$"
+  "Grep filter matching exactly what `denote-notion--conflicted-p' checks:
+`notion_conflict' set to the bare, unquoted symbol `t' (formatted as the
+literal text \"t\" by `denote-notion--frontmatter-format-value', never a
+quoted string) -- not merely present, and not the empty string
+`denote-notion--finish-conflict-resolution' clears it to once resolved.
+Kept as a single literal constant, rather than built from
+`denote-notion--frontmatter-nonempty-value-regexp' (which assumes a
+quoted value), since this field's truthy value is unquoted text, a
+different shape from every other tracking field this file writes.")
+
+(defun denote-notion--dash-register-view (name grep-filter)
+  "Register (or re-register, overwriting) a NAME'd `denote-dash-view'.
+Built with GREP-FILTER as its only populated slot -- every other
+`denote-dash-view' field (narrowed sequences, active directory, sort,
+visible columns, ...) is left nil, meaning \"show everything, unfiltered
+and unsorted, except for GREP-FILTER\" -- the same minimal shape all
+three `denote-notion-dash-view-*' commands share.  Pushed onto
+`denote-dash-saved-views', replacing any existing entry already
+registered under NAME, mirroring `denote-dash-bookmark-save''s own
+replace-by-name convention -- this is exactly what that command does
+interactively, just built programmatically here instead, with no live
+`denote-dash' buffer required to do it."
+  (require 'denote-dash)
+  (setq denote-dash-saved-views
+        (cons (make-denote-dash-view :name name :grep-filter grep-filter)
+              (seq-remove (lambda (v) (equal (denote-dash-view-name v) name))
+                          denote-dash-saved-views))))
+
+;;;###autoload
+(defun denote-notion-dash-view-tracked ()
+  "Open a `denote-dash' view of every Notion-tracked note.
+Registers (or re-registers, overwriting) a `denote-dash-view' named
+`denote-notion--dash-view-tracked-name' whose `grep-filter' matches any
+file with a non-empty `notion_id' front-matter line -- the same
+\"tracked\" test `denote-notion--tracked-p' applies, rewritten as a
+content regexp (see `denote-notion--frontmatter-nonempty-value-regexp')
+since that is all a `denote-dash' grep filter is.  Then opens the view
+via `denote-dash-open-view'."
+  (interactive)
+  (denote-notion--dash-register-view
+   denote-notion--dash-view-tracked-name
+   (denote-notion--frontmatter-nonempty-value-regexp "notion_id"))
+  (denote-dash-open-view denote-notion--dash-view-tracked-name))
+
+;;;###autoload
+(defun denote-notion-dash-view-conflicts ()
+  "Open a `denote-dash' view of every note marked `notion_conflict'.
+Registers (or re-registers, overwriting) a `denote-dash-view' named
+`denote-notion--dash-view-conflicts-name' whose `grep-filter'
+(`denote-notion--dash-conflict-grep-filter') matches exactly what
+`denote-notion--conflicted-p' itself checks, so the view and the
+predicate always agree on what \"conflicted\" means.  Then opens the
+view via `denote-dash-open-view'.  Conflict resolution itself is
+unrelated and unchanged -- see `denote-notion-resolve-conflict'; this
+command only surfaces which notes need it."
+  (interactive)
+  (denote-notion--dash-register-view
+   denote-notion--dash-view-conflicts-name
+   denote-notion--dash-conflict-grep-filter)
+  (denote-dash-open-view denote-notion--dash-view-conflicts-name))
+
+;;; Remote-updated view: backgrounded per-note remote timestamp check
+
+(defconst denote-notion--dash-remote-dirty-grep-filter
+  "^notion_remote_dirty:[ \t]*t[ \t]*$"
+  "Grep filter matching a file whose `notion_remote_dirty' marker is set.
+Same unquoted-`t' shape as `denote-notion--dash-conflict-grep-filter' --
+see `denote-notion--remote-dirty-p', `denote-notion--mark-remote-dirty'.")
+
+(defun denote-notion--remote-dirty-p (file)
+  "Return non-nil if FILE is marked `notion_remote_dirty'.
+Mirrors `denote-notion--conflicted-p''s shape exactly: the truthy value
+is the bare symbol `t' (formatted as the string \"t\"), distinguished
+from both \"absent\" and \"present but cleared to the empty string\" --
+not merely from \"absent\", the way `denote-notion--tracked-p' only needs
+to tell apart.  `notion_remote_dirty' is a dedicated, purely local
+bookkeeping field (see `denote-notion--mark-remote-dirty') -- it is never
+read by `denote-notion--sync-state', `denote-notion-push', or
+`denote-notion-pull', and never sent to Notion; it exists solely so
+`denote-notion-dash-view-remote-updated' can stay a plain grep-filter
+view, structurally identical to the other two `denote-notion-dash-view-*'
+commands, instead of needing some new filtering primitive in
+`denote-dash' itself."
+  (let ((value (denote-notion--frontmatter-get file "notion_remote_dirty")))
+    (and value (string= value "t"))))
+
+(defun denote-notion--mark-remote-dirty (file dirty)
+  "Set FILE's `notion_remote_dirty' marker to t if DIRTY, else clear it.
+Clearing writes the empty string, not a removed line -- see
+`denote-notion--finish-conflict-resolution''s identical convention for
+`notion_conflict', which this field's lifecycle otherwise mirrors."
+  (denote-notion--frontmatter-set file "notion_remote_dirty" (if dirty t "")))
+
+(defun denote-notion--remote-timestamp-stale-p (stored-edited remote-edited)
+  "Return non-nil if REMOTE-EDITED has advanced past STORED-EDITED.
+Pure decision logic, factored out of `denote-notion--sync-state''s own
+inline `remote-changed-p' computation so it can be unit-tested directly,
+without a live network fetch: both arguments are raw ISO-8601 timestamp
+strings, compared with `string>' because they sort lexically (exactly as
+`denote-notion--sync-state' and `denote-notion--export-update' already
+rely on).  A nil or empty STORED-EDITED (nothing recorded as synced yet)
+or a nil REMOTE-EDITED (fetch failed to report one) is never considered
+stale -- the conservative \"nothing has moved\" default, matching
+`denote-notion--sync-state''s own guard."
+  (and remote-edited stored-edited
+       (not (string-empty-p stored-edited))
+       (string> remote-edited stored-edited)))
+
+(defun denote-notion--refresh-remote-dirty-marker-async (file on-done)
+  "Asynchronously refresh FILE's `notion_remote_dirty' marker; then call ON-DONE.
+Fetches FILE's Notion page once via `denote-notion--run-json-async'
+\(\"pages get\"), compares the returned `last_edited_time' against FILE's
+own stored `notion_edited' (see `denote-notion--remote-timestamp-stale-p'),
+and writes the result via `denote-notion--mark-remote-dirty'.  ON-DONE is
+called with no arguments once the marker has been updated, or immediately
+if FILE has no readable `notion_id' or the fetch failed -- regardless of
+outcome, so a caller refreshing a whole directory of tracked notes can
+count completions uniformly without special-casing failures."
+  (let* ((id (ignore-errors
+               (string-trim (denote-notion--frontmatter-get file "notion_id") "\"" "\"")))
+         (stored-edited (string-trim (or (denote-notion--frontmatter-get file "notion_edited") "") "\"" "\"")))
+    (if (not (and id (not (string-empty-p id))))
+        (funcall on-done)
+      (denote-notion--run-json-async
+       (list "pages" "get" id)
+       (lambda (error result)
+         (unwind-protect
+             (unless error
+               (let ((remote-edited (map-elt (map-elt result 'page) 'last_edited_time)))
+                 (denote-notion--mark-remote-dirty
+                  file (denote-notion--remote-timestamp-stale-p stored-edited remote-edited))))
+           (funcall on-done)))))))
+
+;;;###autoload
+(defun denote-notion-dash-view-remote-updated ()
+  "Open a backgrounded `denote-dash' view of notes updated on Notion.
+Unlike `denote-notion-dash-view-tracked'/`-conflicts', \"updated
+remotely\" cannot be decided from a note's own file content alone -- it
+requires comparing each tracked note's live Notion `last_edited_time'
+against its own stored `notion_edited', which means one network fetch
+per tracked note.  Per this feature's ANSWERED open question (see the
+implementation plan's Design section), that fetch is never allowed to
+block opening the view:
+
+1. The view is registered and opened immediately, via the same
+   `denote-notion--dash-register-view' / `denote-dash-open-view' pair
+   the other two `denote-notion-dash-view-*' commands use, with whatever
+   `notion_remote_dirty' marker state (see
+   `denote-notion--remote-dirty-p') is already on disk from some earlier
+   refresh.  Stale is fine, and expected -- that is the whole point of
+   \"instant open\".
+2. A fresh per-note async fetch
+   (`denote-notion--refresh-remote-dirty-marker-async') is then kicked
+   off for every currently Notion-tracked file, each one
+   updating that note's own marker field in place as its fetch
+   completes, then refreshing the view's buffer (looked up by name,
+   guarded with `buffer-live-p' since the user may have killed it before
+   a given fetch finishes) via `denote-dash-refresh', so entries update
+   in the open buffer incrementally rather than all at once.
+
+`notion_remote_dirty' is a dedicated, purely local bookkeeping field
+introduced for this view alone -- chosen deliberately over an in-memory
+note-id -> bool table so this view stays structurally identical to its
+two siblings (register a `denote-dash-view' with a `grep-filter', open
+it) -- no new filtering primitive belongs in `denote-dash' itself for
+this.  It also persists across sessions the same way `denote-dash-saved-views'
+already does, so a later re-open of this view still reflects the last
+background refresh's results even before a fresh one runs again."
+  (interactive)
+  (denote-notion--dash-register-view
+   denote-notion--dash-view-remote-updated-name
+   denote-notion--dash-remote-dirty-grep-filter)
+  (denote-dash-open-view denote-notion--dash-view-remote-updated-name)
+  (let* ((buffer-name (denote-dash--view-buffer-name denote-notion--dash-view-remote-updated-name))
+         (files (seq-filter #'denote-notion--tracked-p (denote-directory-files))))
+    (dolist (file files)
+      (denote-notion--refresh-remote-dirty-marker-async
+       file
+       (lambda ()
+         (when-let* ((buf (get-buffer buffer-name)))
+           (when (buffer-live-p buf)
+             (with-current-buffer buf
+               (denote-dash-refresh)))))))))
+
+;;; Batch sync: bounded async process-pool over every tracked note
+
+(defun denote-notion--batch-run (generator max-concurrent process-fn on-complete)
+  "Drive PROCESS-FN over GENERATOR with at most MAX-CONCURRENT items in flight.
+GENERATOR is a `gen' struct (see `gen-wrap').  Items are pulled one at a
+time via the public, built-in `generator.el' primitive `iter-next' on
+GENERATOR's own raw iterator (`gen-iter'), wrapped in a `condition-case'
+catching `iter-end-of-sequence' -- the exact pattern `gen.el''s own
+private `gen--next' uses internally, just called from here directly,
+since gen.el's `gen--next'/`gen--peek'/`gen--drain' are that package's
+own private implementation details for its `seq.el' methods, not a
+public pull-one-at-a-time API this dispatcher is meant to reach for.
+Pulling lazily, one item per freed slot, rather than eagerly listing and
+classifying every tracked note up front, is the whole point of building
+this over a generator at all -- see `denote-notion-sync-all'.
+
+PROCESS-FN is called as \(PROCESS-FN ITEM DONE-FN\) for each item pulled;
+it must arrange for DONE-FN to be called -- synchronously or
+asynchronously, it makes no difference here -- exactly once when ITEM's
+work has finished, regardless of success or failure.  A slot freed by one
+DONE-FN call is immediately refilled from GENERATOR if another item
+remains, so at most MAX-CONCURRENT items are ever mid-flight at once.
+
+ON-COMPLETE is called with no arguments exactly once, after GENERATOR is
+exhausted and every dispatched item's DONE-FN has fired -- including the
+degenerate case of an already-empty GENERATOR, where it fires immediately
+with nothing ever dispatched."
+  (let ((in-flight 0)
+        (exhausted nil)
+        (iter (gen-iter generator)))
+    (letrec
+        ((maybe-finish
+          (lambda ()
+            (when (and exhausted (zerop in-flight))
+              (funcall on-complete))))
+         (dispatch-one
+          (lambda ()
+            (unless exhausted
+              (let (item got-item)
+                (condition-case nil
+                    (progn (setq item (iter-next iter)) (setq got-item t))
+                  (iter-end-of-sequence (setq exhausted t)))
+                (when got-item
+                  (setq in-flight (1+ in-flight))
+                  (funcall process-fn
+                           item
+                           (lambda (&rest _ignored)
+                             (setq in-flight (1- in-flight))
+                             (funcall dispatch-one)
+                             (funcall maybe-finish)))))))))
+      (if (<= max-concurrent 0)
+          (funcall on-complete)
+        (dotimes (_ max-concurrent) (funcall dispatch-one))
+        (funcall maybe-finish)))))
+
+(defun denote-notion--sync-all-process-note (file counts done)
+  "Classify and sync FILE for `denote-notion-sync-all', recording its outcome.
+COUNTS is an alist of (SYMBOL . COUNT) with keys `unchanged', `pushed',
+`pulled', `conflicted', `errored' -- exactly `denote-notion-sync-all''s
+five summary buckets; this increments the appropriate cell by `cl-incf'
+before calling DONE (with no arguments), so the caller's summary reflects
+every note's outcome regardless of which branch below handled it.
+
+Classification runs through `denote-notion--sync-state-async' (one async
+`pages get' call) rather than the blocking `denote-notion--sync-state' --
+see that function's docstring for why a blocking per-note classification
+call would reintroduce the serial-blocking problem batch sync exists to
+avoid.  Each of the four classifications dispatches the corresponding
+action documented on `denote-notion-sync-all', at most one more `ntn'
+call each:
+- `unchanged' -- nothing further; recorded as `unchanged'.
+- `local-only' -- pushed via `denote-notion--export-push-async' (not a
+  second, redundant `denote-notion--sync-state' fetch); recorded as
+  `pushed', or `errored' on an `ntn' failure.
+- `remote-only' -- pulled via `denote-notion--import-refresh-file-async';
+  recorded as `pulled', or `errored' on an `ntn' failure.
+- `both-changed' -- FILE's `notion_conflict' flag is set directly (the
+  same field `denote-notion--export-update' sets for this case), with no
+  further network call and no `user-error' -- there is no minibuffer
+  prompt watching a batch run for this to interrupt; recorded as
+  `conflicted'.
+
+Any synchronous error raised before an async callback is ever reached
+(a malformed front-matter value, FILE mysteriously becoming untracked
+mid-batch) is also caught and recorded as `errored', exactly like an
+`ntn' failure -- one note's problem, of any kind, must never stop the
+rest of the batch or leave DONE uncalled."
+  (cl-flet ((record (key)
+              (cl-incf (cdr (assq key counts)))
+              (funcall done)))
+    (condition-case nil
+        (denote-notion--sync-state-async
+         file
+         (lambda (error state)
+           (cond
+            (error (record 'errored))
+            (t
+             (pcase state
+               ('unchanged (record 'unchanged))
+               ('local-only
+                (condition-case nil
+                    (denote-notion--export-push-async
+                     file (lambda (error2 _result) (record (if error2 'errored 'pushed))))
+                  (error (record 'errored))))
+               ('remote-only
+                (let ((id (string-trim (denote-notion--frontmatter-get file "notion_id") "\"" "\"")))
+                  (condition-case nil
+                      (denote-notion--import-refresh-file-async
+                       file id (lambda (error3) (record (if error3 'errored 'pulled))))
+                    (error (record 'errored)))))
+               ('both-changed
+                (denote-notion--frontmatter-set file "notion_conflict" t)
+                (record 'conflicted)))))))
+      (error (record 'errored)))))
+
+;;;###autoload
+(defun denote-notion-sync-all ()
+  "Batch-sync every Notion-tracked note via a bounded async process pool.
+
+Builds a lazy generator (see `gen-wrap') over every file under
+`denote-directory-files' for which `denote-notion--tracked-p' is
+non-nil, wrapping a plain `iter-make' that filters and yields one file at
+a time -- never materializing or classifying the full list of tracked
+notes up front, so e.g. note 400's `pages get' call is never made at all
+if note 50's turns out to already need the user's attention and the rest
+of the run is otherwise cut short.  `denote-notion--batch-run' then drives
+that generator, keeping at most `denote-notion-batch-max-concurrent-processes'
+notes' worth of `ntn' subprocesses in flight at once (see
+`denote-notion--sync-all-process-note' for what each note's sync
+actually does), rather than either blocking Emacs for the whole batch
+serially (the problem this command exists to solve) or starting every
+tracked note's subprocess at once regardless of count.
+
+Reports a one-line `message' summary of counts across five buckets:
+unchanged, pushed, pulled, conflicted, errored.  A plain `message' was
+judged sufficient here, matching this feature's own interaction example
+in the implementation plan, rather than a dedicated results buffer --
+nothing below needs random access to individual outcomes, only the
+aggregate counts, and `denote-notion--debug-buffer-name' already
+accumulates every `ntn' call's raw output (including failures) for
+anyone who needs to look closer at exactly which note did what.
+
+One note's failure -- a non-zero `ntn' exit, an unexpected error --never
+halts the batch; it is simply counted as `errored' and the run continues
+with every other note, unlike a single interactive
+`denote-notion-push''s own failure, which signals and stops that one
+call outright -- there is no minibuffer prompt watching a batch run for
+a signal to usefully interrupt."
+  (interactive)
+  (let* ((generator (gen-wrap
+                     (iter-make
+                      (dolist (f (seq-filter #'denote-notion--tracked-p (denote-directory-files)))
+                        (iter-yield f)))))
+         (counts (list (cons 'unchanged 0) (cons 'pushed 0) (cons 'pulled 0)
+                       (cons 'conflicted 0) (cons 'errored 0))))
+    (denote-notion--batch-run
+     generator
+     denote-notion-batch-max-concurrent-processes
+     (lambda (file done) (denote-notion--sync-all-process-note file counts done))
+     (lambda ()
+       (message "denote-notion-sync-all: %d unchanged, %d pushed, %d pulled, %d conflicted, %d errored"
+                (cdr (assq 'unchanged counts)) (cdr (assq 'pushed counts))
+                (cdr (assq 'pulled counts)) (cdr (assq 'conflicted counts))
+                (cdr (assq 'errored counts)))))))
 
 (provide 'denote-notion)
 ;;; denote-notion.el ends here

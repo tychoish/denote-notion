@@ -10,6 +10,17 @@
 (require 'ert)
 (require 'denote-notion)
 
+;; `denote-dash' is a soft dependency (see `denote-notion--dash-register-view'
+;; and friends): not declared in this package's own `Package-Requires', so it
+;; is not guaranteed to already be on `load-path' the way `denote'/`cl-lib'
+;; are.  Add the sibling checkout's directory the same way this package's own
+;; CI/dev environment would, so these tests can `require' it the same way
+;; the main file's dash-view commands do.
+(let ((sibling (expand-file-name "../../denote-dash" (file-name-directory (or load-file-name buffer-file-name)))))
+  (when (file-directory-p sibling)
+    (add-to-list 'load-path sibling)))
+(require 'denote-dash)
+
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; fixtures
 
@@ -74,6 +85,27 @@ Untracked body.
          (with-current-buffer buf (set-buffer-modified-p nil))
          (kill-buffer buf)))))
 
+(defmacro test-denote-notion--with-temp-denote-dir (dir-var &rest body)
+  "Bind DIR-VAR to a fresh temp directory, run BODY, then clean up.
+Several end-to-end tests below (auto-push cycles, pull/import, batch
+sync) need a real directory of denote-style files rather than a single
+fixture file, since they exercise `denote-directory-files' or a
+filename-embedded identifier directly.  Cleanup kills any buffer still
+visiting a file under DIR-VAR -- `find-file-noselect'/`denote' leave
+one behind, and a lingering modified buffer from one test can otherwise
+bleed into another -- then deletes DIR-VAR itself, both unconditionally
+via `unwind-protect' so a failing assertion in BODY still cleans up."
+  (declare (indent 1))
+  `(let ((,dir-var (make-temp-file "denote-notion-test-" t)))
+     (unwind-protect
+         (progn ,@body)
+       (dolist (buf (buffer-list))
+         (when-let* ((f (buffer-file-name buf)))
+           (when (string-prefix-p (expand-file-name ,dir-var) (expand-file-name f))
+             (with-current-buffer buf (set-buffer-modified-p nil))
+             (kill-buffer buf))))
+       (delete-directory ,dir-var t))))
+
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; denote-notion--frontmatter-get
 
@@ -123,6 +155,29 @@ Untracked body.
   "A note with no notion_id is not tracked."
   (test-denote-notion--with-fixture test-denote-notion--untracked-fixture
     (should-not (denote-notion--tracked-p file))))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; denote-notion--conflicted-p
+
+(ert-deftest test-denote-notion/conflicted-p-true ()
+  "A note with notion_conflict set to t is conflicted."
+  (test-denote-notion--with-fixture test-denote-notion--md-fixture
+    (denote-notion--frontmatter-set file "notion_conflict" t)
+    (should (denote-notion--conflicted-p file))))
+
+(ert-deftest test-denote-notion/conflicted-p-false-absent ()
+  "A note with no notion_conflict line is not conflicted."
+  (test-denote-notion--with-fixture test-denote-notion--md-fixture
+    (should-not (denote-notion--conflicted-p file))))
+
+(ert-deftest test-denote-notion/conflicted-p-false-cleared ()
+  "A note whose notion_conflict was cleared to the empty string is not
+conflicted -- `denote-notion--finish-conflict-resolution's clearing
+convention."
+  (test-denote-notion--with-fixture test-denote-notion--md-fixture
+    (denote-notion--frontmatter-set file "notion_conflict" t)
+    (denote-notion--frontmatter-set file "notion_conflict" "")
+    (should-not (denote-notion--conflicted-p file))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; denote-notion--body-without-front-matter
@@ -342,46 +397,39 @@ filename, not just front matter) since
 `denote-notion--auto-push-dependency's in-flight bookkeeping keys off
 `denote-retrieve-filename-identifier', which parses the filename, not
 the front matter."
-  (let* ((id-a "20260201T000000")
-         (id-b "20260201T000001")
-         (dir (make-temp-file "denote-notion-test-" t))
-         (file-a (expand-file-name (format "%s--note-a__tag.md" id-a) dir))
-         (file-b (expand-file-name (format "%s--note-b__tag.md" id-b) dir)))
-    (unwind-protect
-        (let ((denote-notion-export-auto-push-linked-notes t)
-              (denote-notion-default-parent '(database . "db-id"))
-              (create-contents nil))
-          (with-temp-file file-a
-            (insert (format "---\ntitle: \"A\"\nidentifier: \"%s\"\n---\n\nSee [B](denote:%s) here.\n" id-a id-b)))
-          (with-temp-file file-b
-            (insert (format "---\ntitle: \"B\"\nidentifier: \"%s\"\n---\n\nSee [A](denote:%s) here.\n" id-b id-a)))
-          (cl-letf (((symbol-function 'denote-get-path-by-id)
-                     (lambda (id)
-                       (cond ((equal id id-a) file-a)
-                             ((equal id id-b) file-b))))
-                    ((symbol-function 'denote-notion--run-json)
-                     (lambda (args)
-                       (when (member "create" args)
-                         (push (nth (1+ (seq-position args "--content")) args) create-contents))
-                       (json-parse-string test-denote-notion--create-response-json
-                                          :object-type 'alist :array-type 'list))))
-            (denote-notion-push file-a))
-          ;; B's create (triggered as a dependency of A's export) happens
-          ;; before A's own create call -- see the commentary above.
-          (setq create-contents (nreverse create-contents))
-          (should (denote-notion--tracked-p file-a))
-          (should (denote-notion--tracked-p file-b))
-          (should (equal (length create-contents) 2))
-          (should (equal (nth 0 create-contents) "See A here."))
-          (should (string-match-p (regexp-quote "https://www.notion.so/") (nth 1 create-contents)))
-          (with-current-buffer (get-buffer-create denote-notion--debug-buffer-name)
-            (should (string-match-p "cycle-detected" (buffer-string)))))
-      (dolist (buf (buffer-list))
-        (when-let* ((f (buffer-file-name buf)))
-          (when (string-prefix-p (expand-file-name dir) (expand-file-name f))
-            (with-current-buffer buf (set-buffer-modified-p nil))
-            (kill-buffer buf))))
-      (delete-directory dir t))))
+  (test-denote-notion--with-temp-denote-dir dir
+    (let* ((id-a "20260201T000000")
+           (id-b "20260201T000001")
+           (file-a (expand-file-name (format "%s--note-a__tag.md" id-a) dir))
+           (file-b (expand-file-name (format "%s--note-b__tag.md" id-b) dir))
+           (denote-notion-export-auto-push-linked-notes t)
+           (denote-notion-default-parent '(database . "db-id"))
+           (create-contents nil))
+      (with-temp-file file-a
+        (insert (format "---\ntitle: \"A\"\nidentifier: \"%s\"\n---\n\nSee [B](denote:%s) here.\n" id-a id-b)))
+      (with-temp-file file-b
+        (insert (format "---\ntitle: \"B\"\nidentifier: \"%s\"\n---\n\nSee [A](denote:%s) here.\n" id-b id-a)))
+      (cl-letf (((symbol-function 'denote-get-path-by-id)
+                 (lambda (id)
+                   (cond ((equal id id-a) file-a)
+                         ((equal id id-b) file-b))))
+                ((symbol-function 'denote-notion--run-json)
+                 (lambda (args)
+                   (when (member "create" args)
+                     (push (nth (1+ (seq-position args "--content")) args) create-contents))
+                   (json-parse-string test-denote-notion--create-response-json
+                                      :object-type 'alist :array-type 'list))))
+        (denote-notion-push file-a))
+      ;; B's create (triggered as a dependency of A's export) happens
+      ;; before A's own create call -- see the commentary above.
+      (setq create-contents (nreverse create-contents))
+      (should (denote-notion--tracked-p file-a))
+      (should (denote-notion--tracked-p file-b))
+      (should (equal (length create-contents) 2))
+      (should (equal (nth 0 create-contents) "See A here."))
+      (should (string-match-p (regexp-quote "https://www.notion.so/") (nth 1 create-contents)))
+      (with-current-buffer (get-buffer-create denote-notion--debug-buffer-name)
+        (should (string-match-p "cycle-detected" (buffer-string)))))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; denote-notion-push: end-to-end auto-push of a non-cyclic dependency
@@ -396,44 +444,37 @@ the front matter."
 (ert-deftest test-denote-notion/push-a-links-b-no-cycle-auto-pushes-and-resolves ()
   "A push of A, where A links to B and B does NOT link back to A, pushes B
 as a dependency and resolves A's link to B to a normal Notion URL."
-  (let* ((id-a "20260301T000000")
-         (id-b "20260301T000001")
-         (dir (make-temp-file "denote-notion-test-" t))
-         (file-a (expand-file-name (format "%s--note-a__tag.md" id-a) dir))
-         (file-b (expand-file-name (format "%s--note-b__tag.md" id-b) dir)))
-    (unwind-protect
-        (let ((denote-notion-export-auto-push-linked-notes t)
-              (denote-notion-default-parent '(database . "db-id"))
-              (create-contents nil))
-          (with-temp-file file-a
-            (insert (format "---\ntitle: \"A\"\nidentifier: \"%s\"\n---\n\nSee [B](denote:%s) here.\n" id-a id-b)))
-          (with-temp-file file-b
-            (insert (format "---\ntitle: \"B\"\nidentifier: \"%s\"\n---\n\nJust B, no links back.\n" id-b)))
-          (cl-letf (((symbol-function 'denote-get-path-by-id)
-                     (lambda (id)
-                       (cond ((equal id id-a) file-a)
-                             ((equal id id-b) file-b))))
-                    ((symbol-function 'denote-notion--run-json)
-                     (lambda (args)
-                       (when (member "create" args)
-                         (push (nth (1+ (seq-position args "--content")) args) create-contents))
-                       (json-parse-string test-denote-notion--create-response-json
-                                          :object-type 'alist :array-type 'list))))
-            (denote-notion-push file-a))
-          ;; B's create (triggered as a dependency of A's export) happens
-          ;; before A's own create call, as in the cycle test above.
-          (setq create-contents (nreverse create-contents))
-          (should (denote-notion--tracked-p file-b))
-          (should (equal (length create-contents) 2))
-          (should (equal (nth 0 create-contents) "Just B, no links back."))
-          (should (string-match-p "\\[B\\](https://www\\.notion\\.so/[[:alnum:]]+) here\\."
-                                  (nth 1 create-contents))))
-      (dolist (buf (buffer-list))
-        (when-let* ((f (buffer-file-name buf)))
-          (when (string-prefix-p (expand-file-name dir) (expand-file-name f))
-            (with-current-buffer buf (set-buffer-modified-p nil))
-            (kill-buffer buf))))
-      (delete-directory dir t))))
+  (test-denote-notion--with-temp-denote-dir dir
+    (let* ((id-a "20260301T000000")
+           (id-b "20260301T000001")
+           (file-a (expand-file-name (format "%s--note-a__tag.md" id-a) dir))
+           (file-b (expand-file-name (format "%s--note-b__tag.md" id-b) dir))
+           (denote-notion-export-auto-push-linked-notes t)
+           (denote-notion-default-parent '(database . "db-id"))
+           (create-contents nil))
+      (with-temp-file file-a
+        (insert (format "---\ntitle: \"A\"\nidentifier: \"%s\"\n---\n\nSee [B](denote:%s) here.\n" id-a id-b)))
+      (with-temp-file file-b
+        (insert (format "---\ntitle: \"B\"\nidentifier: \"%s\"\n---\n\nJust B, no links back.\n" id-b)))
+      (cl-letf (((symbol-function 'denote-get-path-by-id)
+                 (lambda (id)
+                   (cond ((equal id id-a) file-a)
+                         ((equal id id-b) file-b))))
+                ((symbol-function 'denote-notion--run-json)
+                 (lambda (args)
+                   (when (member "create" args)
+                     (push (nth (1+ (seq-position args "--content")) args) create-contents))
+                   (json-parse-string test-denote-notion--create-response-json
+                                      :object-type 'alist :array-type 'list))))
+        (denote-notion-push file-a))
+      ;; B's create (triggered as a dependency of A's export) happens
+      ;; before A's own create call, as in the cycle test above.
+      (setq create-contents (nreverse create-contents))
+      (should (denote-notion--tracked-p file-b))
+      (should (equal (length create-contents) 2))
+      (should (equal (nth 0 create-contents) "Just B, no links back."))
+      (should (string-match-p "\\[B\\](https://www\\.notion\\.so/[[:alnum:]]+) here\\."
+                              (nth 1 create-contents))))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; denote-notion--extract-page-id
@@ -694,6 +735,40 @@ after the registry entry's display name has been renamed."
                    "\"2026-04-01T00:00:00.000Z\""))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; denote-notion--export-update, FORCE non-nil: end-to-end through the
+;; literal `denote-notion--export-update' call site, not just
+;; `denote-notion--export-apply-pushed-page' in isolation -- confirms the
+;; FORCE branch's "apply pushed page" logic, extracted into that shared
+;; helper during the cleanup sweep, still records the pushed content's
+;; hash and cache snapshot correctly when reached from this call site.
+
+(ert-deftest test-denote-notion/export-update-force-records-synced-content-hash-and-cache ()
+  "A FORCE push through `denote-notion--export-update' records the pushed
+content's hash as `notion_sync_hash' and writes that same content to the
+id's on-disk cache, via `denote-notion--record-synced-content' inside
+`denote-notion--export-apply-pushed-page'."
+  (test-denote-notion--with-fixture test-denote-notion--md-fixture
+    (let ((denote-notion-cache-directory (make-temp-file "denote-notion-cache-test-" t))
+          (id "2f094bf7-31a4-8081-8280-f0a225af4db2"))
+      (unwind-protect
+          (progn
+            (cl-letf (((symbol-function 'denote-notion--run-json)
+                       (lambda (args)
+                         (cond
+                          ((member "edit" args)
+                           (json-parse-string test-denote-notion--edit-response-json
+                                              :object-type 'alist :array-type 'list))
+                          ((member "get" args)
+                           (json-parse-string test-denote-notion--get-response-json
+                                              :object-type 'alist :array-type 'list))
+                          (t (error "unexpected call in force path: %S" args))))))
+              (denote-notion--export-update file t))
+            (should (equal (denote-notion--frontmatter-get file "notion_sync_hash")
+                           (format "%S" (denote-notion--content-hash "## Body\n\nBody content here."))))
+            (should (equal (denote-notion--cache-read id) "## Body\n\nBody content here.")))
+        (delete-directory denote-notion-cache-directory t)))))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; denote-notion--resolve-property-sentinels
 
 (ert-deftest test-denote-notion/resolve-property-sentinels-replaces-today ()
@@ -848,32 +923,25 @@ title) are concatenated into a single string."
   "Importing a new page extracts the plain-text title (not the raw
 rich_text array), backdates the note's identifier/date to the page's
 `created_time' instead of \"now\", and cleans up the body."
-  (let ((dir (make-temp-file "denote-notion-test-" t)))
-    (unwind-protect
-        (let ((denote-directory (list dir)))
-          (cl-letf (((symbol-function 'denote-notion--run-json)
-                     (lambda (&rest _)
-                       (json-parse-string test-denote-notion--get-page-response-json
-                                          :object-type 'alist :array-type 'list))))
-            (denote-notion-pull "page-id"))
-          (let ((file (car (directory-files dir t "imported-title"))))
-            (should file)
-            (should (string-suffix-p ".md" file))
-            (should (string-prefix-p
-                     (format-time-string "%Y%m%d" (date-to-time "2020-05-04T10:00:00.000Z"))
-                     (file-name-nondirectory file)))
-            (should (equal (denote-notion--frontmatter-get file "notion_id") "\"page-id\""))
-            (with-temp-buffer
-              (insert-file-contents file)
-              (should (string-match-p "one\ntwo" (buffer-string)))
-              (should (string-match-p "\\[design\\]" (buffer-string)))
-              (should-not (string-match-p "<br>" (buffer-string))))))
-      (dolist (buf (buffer-list))
-        (when-let* ((f (buffer-file-name buf)))
-          (when (string-prefix-p (expand-file-name dir) (expand-file-name f))
-            (with-current-buffer buf (set-buffer-modified-p nil))
-            (kill-buffer buf))))
-      (delete-directory dir t))))
+  (test-denote-notion--with-temp-denote-dir dir
+    (let ((denote-directory (list dir)))
+      (cl-letf (((symbol-function 'denote-notion--run-json)
+                 (lambda (&rest _)
+                   (json-parse-string test-denote-notion--get-page-response-json
+                                      :object-type 'alist :array-type 'list))))
+        (denote-notion-pull "page-id"))
+      (let ((file (car (directory-files dir t "imported-title"))))
+        (should file)
+        (should (string-suffix-p ".md" file))
+        (should (string-prefix-p
+                 (format-time-string "%Y%m%d" (date-to-time "2020-05-04T10:00:00.000Z"))
+                 (file-name-nondirectory file)))
+        (should (equal (denote-notion--frontmatter-get file "notion_id") "\"page-id\""))
+        (with-temp-buffer
+          (insert-file-contents file)
+          (should (string-match-p "one\ntwo" (buffer-string)))
+          (should (string-match-p "\\[design\\]" (buffer-string)))
+          (should-not (string-match-p "<br>" (buffer-string))))))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; denote-notion-pull: dwim refresh with no page id
@@ -922,41 +990,32 @@ stale tags; the fetched page now has only one."
 (ert-deftest test-denote-notion/find-tracked-file-locates-match-anywhere ()
   "Finds the tracking file by notion_id across the whole denote directory,
 not just the current buffer."
-  (let ((dir (make-temp-file "denote-notion-test-" t)))
-    (unwind-protect
-        (let ((denote-directory (list dir)))
-          (let ((f1 (expand-file-name "20260101T000000--one__tag.md" dir))
-                (f2 (expand-file-name "20260101T000001--two__tag.md" dir)))
-            (with-temp-file f1 (insert "---\ntitle: \"One\"\nidentifier: \"20260101T000000\"\nnotion_id: \"other-page\"\n---\n\nbody\n"))
-            (with-temp-file f2 (insert "---\ntitle: \"Two\"\nidentifier: \"20260101T000001\"\nnotion_id: \"page-id\"\n---\n\nbody\n"))
-            (should (equal (denote-notion--find-tracked-file "page-id") f2))
-            (should-not (denote-notion--find-tracked-file "no-such-id"))))
-      (delete-directory dir t))))
+  (test-denote-notion--with-temp-denote-dir dir
+    (let ((denote-directory (list dir)))
+      (let ((f1 (expand-file-name "20260101T000000--one__tag.md" dir))
+            (f2 (expand-file-name "20260101T000001--two__tag.md" dir)))
+        (with-temp-file f1 (insert "---\ntitle: \"One\"\nidentifier: \"20260101T000000\"\nnotion_id: \"other-page\"\n---\n\nbody\n"))
+        (with-temp-file f2 (insert "---\ntitle: \"Two\"\nidentifier: \"20260101T000001\"\nnotion_id: \"page-id\"\n---\n\nbody\n"))
+        (should (equal (denote-notion--find-tracked-file "page-id") f2))
+        (should-not (denote-notion--find-tracked-file "no-such-id"))))))
 
 (ert-deftest test-denote-notion/import-page-refreshes-existing-tracked-file-instead-of-duplicating ()
   "Importing a page id already tracked by some other note (not the
 current buffer, and not an explicit TARGET-FILE) refreshes that note
 instead of creating a duplicate."
-  (let ((dir (make-temp-file "denote-notion-test-" t)))
-    (unwind-protect
-        (let ((denote-directory (list dir))
-              (tracked (expand-file-name "20260101T000000--already-tracked__tag.md" dir)))
-          (with-temp-file tracked
-            (insert "---\ntitle:      \"Already Tracked\"\nidentifier: \"20260101T000000\"\nnotion_id:  \"page-id\"\nnotion_edited: \"2019-01-01T00:00:00.000Z\"\n---\n\nold body\n"))
-          (cl-letf (((symbol-function 'denote-notion--run-json)
-                     (lambda (&rest _)
-                       (json-parse-string test-denote-notion--get-page-response-json
-                                          :object-type 'alist :array-type 'list))))
-            (denote-notion-pull "page-id"))
-          (should (equal (length (directory-files dir nil "\\.md\\'")) 1))
-          (should (equal (denote-notion--frontmatter-get tracked "notion_edited")
-                         "\"2020-05-04T11:00:00.000Z\"")))
-      (dolist (buf (buffer-list))
-        (when-let* ((f (buffer-file-name buf)))
-          (when (string-prefix-p (expand-file-name dir) (expand-file-name f))
-            (with-current-buffer buf (set-buffer-modified-p nil))
-            (kill-buffer buf))))
-      (delete-directory dir t))))
+  (test-denote-notion--with-temp-denote-dir dir
+    (let ((denote-directory (list dir))
+          (tracked (expand-file-name "20260101T000000--already-tracked__tag.md" dir)))
+      (with-temp-file tracked
+        (insert "---\ntitle:      \"Already Tracked\"\nidentifier: \"20260101T000000\"\nnotion_id:  \"page-id\"\nnotion_edited: \"2019-01-01T00:00:00.000Z\"\n---\n\nold body\n"))
+      (cl-letf (((symbol-function 'denote-notion--run-json)
+                 (lambda (&rest _)
+                   (json-parse-string test-denote-notion--get-page-response-json
+                                      :object-type 'alist :array-type 'list))))
+        (denote-notion-pull "page-id"))
+      (should (equal (length (directory-files dir nil "\\.md\\'")) 1))
+      (should (equal (denote-notion--frontmatter-get tracked "notion_edited")
+                     "\"2020-05-04T11:00:00.000Z\"")))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; denote-notion--file-at-point
@@ -1059,6 +1118,890 @@ H1 duplicating the page's own title."
                      nil))))
         (denote-notion--export-update file t))
       (should (equal edit-content "## Body\n\nBody content here.")))))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; denote-notion--content-hash
+
+(ert-deftest test-denote-notion/content-hash-stable-for-same-input ()
+  "Hashing the same content twice returns the same hash."
+  (should (equal (denote-notion--content-hash "same content")
+                 (denote-notion--content-hash "same content"))))
+
+(ert-deftest test-denote-notion/content-hash-differs-for-different-input ()
+  "Hashing different content returns different hashes."
+  (should-not (equal (denote-notion--content-hash "content one")
+                     (denote-notion--content-hash "content two"))))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; denote-notion--cache-read / denote-notion--cache-write
+
+(ert-deftest test-denote-notion/cache-write-then-read-roundtrips ()
+  "Content written for an id is read back unchanged."
+  (let ((denote-notion-cache-directory (make-temp-file "denote-notion-cache-test-" t)))
+    (unwind-protect
+        (progn
+          (denote-notion--cache-write "some-page-id" "cached body content")
+          (should (equal (denote-notion--cache-read "some-page-id") "cached body content")))
+      (delete-directory denote-notion-cache-directory t))))
+
+(ert-deftest test-denote-notion/cache-read-never-written-returns-nil ()
+  "Reading an id with no cache file yet returns nil, rather than erroring."
+  (let ((denote-notion-cache-directory (make-temp-file "denote-notion-cache-test-" t)))
+    (unwind-protect
+        (should-not (denote-notion--cache-read "never-written-id"))
+      (delete-directory denote-notion-cache-directory t))))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; denote-notion--sync-state
+;;
+;; Each test pins FILE's own exportable body to "## Body\n\nBody content
+;; here." (via `test-denote-notion--md-fixture'), so `stored-hash' is set
+;; to exactly that body's hash to simulate "local unchanged", or to some
+;; other string to simulate "local changed".  The remote side is stubbed
+;; via `denote-notion--run-json' to return a page with a controllable
+;; `last_edited_time', compared against the fixture's own stored
+;; `notion_edited' ("2026-02-23T18:18:00.000Z").
+
+(defun test-denote-notion--stub-remote-edited (edited-time)
+  "Return a `denote-notion--run-json' stub reporting EDITED-TIME."
+  (lambda (&rest _)
+    `((page . ((last_edited_time . ,edited-time))))))
+
+(ert-deftest test-denote-notion/sync-state-unchanged ()
+  "Neither side changed: local hash matches, remote not newer than stored."
+  (test-denote-notion--with-fixture test-denote-notion--md-fixture
+    (let ((local-hash (denote-notion--content-hash (car (denote-notion--export-body file)))))
+      (denote-notion--frontmatter-set file "notion_sync_hash" local-hash))
+    (cl-letf (((symbol-function 'denote-notion--run-json)
+               (test-denote-notion--stub-remote-edited "2026-02-23T18:18:00.000Z")))
+      (should (eq (denote-notion--sync-state file) 'unchanged)))))
+
+(ert-deftest test-denote-notion/sync-state-local-only ()
+  "Local changed (stored hash stale), remote not newer than stored."
+  (test-denote-notion--with-fixture test-denote-notion--md-fixture
+    (denote-notion--frontmatter-set file "notion_sync_hash" "stale-hash")
+    (cl-letf (((symbol-function 'denote-notion--run-json)
+               (test-denote-notion--stub-remote-edited "2026-02-23T18:18:00.000Z")))
+      (should (eq (denote-notion--sync-state file) 'local-only)))))
+
+(ert-deftest test-denote-notion/sync-state-remote-only ()
+  "Local unchanged (stored hash current), remote newer than stored."
+  (test-denote-notion--with-fixture test-denote-notion--md-fixture
+    (let ((local-hash (denote-notion--content-hash (car (denote-notion--export-body file)))))
+      (denote-notion--frontmatter-set file "notion_sync_hash" local-hash))
+    (cl-letf (((symbol-function 'denote-notion--run-json)
+               (test-denote-notion--stub-remote-edited "2026-03-01T00:00:00.000Z")))
+      (should (eq (denote-notion--sync-state file) 'remote-only)))))
+
+(ert-deftest test-denote-notion/sync-state-both-changed ()
+  "Local changed (stored hash stale) and remote newer than stored."
+  (test-denote-notion--with-fixture test-denote-notion--md-fixture
+    (denote-notion--frontmatter-set file "notion_sync_hash" "stale-hash")
+    (cl-letf (((symbol-function 'denote-notion--run-json)
+               (test-denote-notion--stub-remote-edited "2026-03-01T00:00:00.000Z")))
+      (should (eq (denote-notion--sync-state file) 'both-changed)))))
+
+(ert-deftest test-denote-notion/sync-state-errors-on-untracked-file ()
+  "Signals a `user-error' when called on a file with no notion_id."
+  (test-denote-notion--with-fixture test-denote-notion--untracked-fixture
+    (should-error (denote-notion--sync-state file) :type 'user-error)))
+
+(ert-deftest test-denote-notion/sync-state-missing-stored-hash-is-local-changed ()
+  "A missing `notion_sync_hash' (never recorded) is treated as local-changed,
+the conservative default, even when the remote side has not moved."
+  (test-denote-notion--with-fixture test-denote-notion--md-fixture
+    (cl-letf (((symbol-function 'denote-notion--run-json)
+               (test-denote-notion--stub-remote-edited "2026-02-23T18:18:00.000Z")))
+      (should (eq (denote-notion--sync-state file) 'local-only)))))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; denote-notion--sync-state-async: the two edge cases confirmed on the
+;; sync path above, confirmed independently on the async path -- the
+;; sync and async sibling share `denote-notion--classify-sync-state' for
+;; the classification rule itself, but each computes `local-changed-p'
+;; and performs its own tracked-p guard independently, so neither case
+;; is guaranteed covered by the other's test.
+
+(ert-deftest test-denote-notion/sync-state-async-missing-stored-hash-is-local-changed ()
+  "The async sibling also treats a missing `notion_sync_hash' as
+local-changed, matching the synchronous path's conservative default."
+  (test-denote-notion--with-fixture test-denote-notion--md-fixture
+    (cl-letf (((symbol-function 'denote-notion--run-json-async)
+               (lambda (_args callback)
+                 (funcall callback nil '((page . ((last_edited_time . "2026-02-23T18:18:00.000Z"))))))))
+      (let (result)
+        (denote-notion--sync-state-async file (lambda (error state) (setq result (list error state))))
+        (should (equal result (list nil 'local-only)))))))
+
+(ert-deftest test-denote-notion/sync-state-async-errors-on-untracked-file ()
+  "Signals a `user-error' synchronously (before any async call is even
+attempted) when called on a file with no notion_id -- the same
+programming-error guard `denote-notion--sync-state' applies, confirmed
+independently on the async path."
+  (test-denote-notion--with-fixture test-denote-notion--untracked-fixture
+    (should-error (denote-notion--sync-state-async file #'ignore) :type 'user-error)))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; denote-notion--export-update: unchanged short-circuit
+
+(ert-deftest test-denote-notion/export-update-unchanged-skips-pages-edit ()
+  "When `denote-notion--sync-state' reports `unchanged', `ntn pages edit' is
+never invoked at all."
+  (test-denote-notion--with-fixture test-denote-notion--md-fixture
+    (let ((local-hash (denote-notion--content-hash (car (denote-notion--export-body file)))))
+      (denote-notion--frontmatter-set file "notion_sync_hash" local-hash))
+    (cl-letf (((symbol-function 'denote-notion--run-json)
+               (lambda (args)
+                 (cond
+                  ((member "edit" args) (error "unexpected pages edit call on an unchanged file"))
+                  ((member "get" args) `((page . ((last_edited_time . "2026-02-23T18:18:00.000Z")))))
+                  (t (error "unexpected call: %S" args))))))
+      (denote-notion--export-update file nil))))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; denote-notion--export-update: both-changed sets notion_conflict,
+;; does not user-error
+
+(ert-deftest test-denote-notion/export-update-both-changed-sets-conflict-flag-no-error ()
+  "On `both-changed', `notion_conflict' is set and no `user-error' is raised
+\(this replaces the old unconditional `user-error' on a stale push\);
+`ntn pages edit' is never invoked."
+  (test-denote-notion--with-fixture test-denote-notion--md-fixture
+    (denote-notion--frontmatter-set file "notion_sync_hash" "stale-hash")
+    (cl-letf (((symbol-function 'denote-notion--run-json)
+               (lambda (args)
+                 (cond
+                  ((member "edit" args) (error "unexpected pages edit call on a both-changed file"))
+                  ((member "get" args) `((page . ((last_edited_time . "2026-03-01T00:00:00.000Z")))))
+                  (t (error "unexpected call: %S" args))))))
+      (denote-notion--export-update file nil))
+    (should (denote-notion--conflicted-p file))))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; denote-notion--build-conflict-buffers
+
+(ert-deftest test-denote-notion/build-conflict-buffers-with-ancestor ()
+  "Local, remote, and ancestor buffers are all populated when a cache entry
+exists for the note's notion_id."
+  (test-denote-notion--with-fixture test-denote-notion--md-fixture
+    (let* ((id (string-trim (denote-notion--frontmatter-get file "notion_id") "\"" "\""))
+           (denote-notion-cache-directory (make-temp-file "denote-notion-cache" t)))
+      (unwind-protect
+          (progn
+            (denote-notion--cache-write id "ancestor body")
+            (cl-letf (((symbol-function 'denote-notion--run-json)
+                       (lambda (&rest _)
+                         `((page . ((id . ,id)))
+                           (markdown . ((markdown . "remote body")))))))
+              (let* ((buffers (denote-notion--build-conflict-buffers file id))
+                     (local (plist-get buffers :local))
+                     (remote (plist-get buffers :remote))
+                     (ancestor (plist-get buffers :ancestor)))
+                (unwind-protect
+                    (progn
+                      (should (equal (with-current-buffer local (buffer-string))
+                                     (car (denote-notion--export-body file))))
+                      (should (equal (with-current-buffer remote (buffer-string)) "remote body"))
+                      (should (buffer-live-p ancestor))
+                      (should (equal (with-current-buffer ancestor (buffer-string)) "ancestor body")))
+                  (dolist (buf (list local remote ancestor))
+                    (when (buffer-live-p buf) (kill-buffer buf)))))))
+        (delete-directory denote-notion-cache-directory t)))))
+
+(ert-deftest test-denote-notion/build-conflict-buffers-without-ancestor ()
+  "The :ancestor slot is nil, not a buffer, when no cache entry exists --
+this is what `denote-notion-resolve-conflict' checks to pick
+`ediff-buffers' over `ediff-merge-buffers-with-ancestor'."
+  (test-denote-notion--with-fixture test-denote-notion--md-fixture
+    (let* ((id (string-trim (denote-notion--frontmatter-get file "notion_id") "\"" "\""))
+           (denote-notion-cache-directory (make-temp-file "denote-notion-cache" t)))
+      (unwind-protect
+          (cl-letf (((symbol-function 'denote-notion--run-json)
+                     (lambda (&rest _)
+                       `((page . ((id . ,id)))
+                         (markdown . ((markdown . "remote body")))))))
+            (let* ((buffers (denote-notion--build-conflict-buffers file id))
+                   (local (plist-get buffers :local))
+                   (remote (plist-get buffers :remote))
+                   (ancestor (plist-get buffers :ancestor)))
+              (unwind-protect
+                  (should-not ancestor)
+                (dolist (buf (list local remote))
+                  (when (buffer-live-p buf) (kill-buffer buf))))))
+        (delete-directory denote-notion-cache-directory t)))))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; denote-notion-resolve-conflict: two-way `ediff-buffers' fallback
+;; (no cached ancestor) -- this had no direct test at all before now; only
+;; `denote-notion--build-conflict-buffers' (buffer construction) and
+;; `denote-notion--finish-conflict-resolution' (write-back/push) were
+;; covered separately.  This confirms the actual buffer-selection logic
+;; inside `denote-notion-resolve-conflict''s own finish lambda: with no
+;; ancestor, the LOCAL buffer's text -- not `ediff-buffer-C', which only a
+;; three-way `ediff-merge-buffers-with-ancestor' session ever populates --
+;; is what gets passed to `denote-notion--finish-conflict-resolution'.
+
+(ert-deftest test-denote-notion/resolve-conflict-two-way-fallback-uses-local-buffer-as-merged-text ()
+  "With no cached ancestor, the two-way `ediff-buffers' fallback's finish
+logic treats the local buffer as the final merged text.  `ediff-buffers'
+is stubbed to immediately run its startup hook (which buffer-locally adds
+the real finish function to `ediff-quit-hook') and then run that hook,
+simulating an immediate quit without a real interactive ediff session."
+  (test-denote-notion--with-fixture test-denote-notion--md-fixture
+    (denote-notion--frontmatter-set file "notion_conflict" t)
+    (let ((denote-notion-cache-directory (make-temp-file "denote-notion-cache-test-" t))
+          (captured-file nil) (captured-content nil))
+      (unwind-protect
+          (with-temp-buffer
+            (cl-letf (((symbol-function 'denote-notion--run-json)
+                       (lambda (&rest _)
+                         '((page . ((id . "ignored")))
+                           (markdown . ((markdown . "remote body differs"))))))
+                      ((symbol-function 'ediff-buffers)
+                       (lambda (_buf-a _buf-b startup-hooks)
+                         (dolist (h startup-hooks) (funcall h))
+                         (run-hooks 'ediff-quit-hook)))
+                      ((symbol-function 'ediff-merge-buffers-with-ancestor)
+                       (lambda (&rest _) (error "should use the two-way fallback, not the three-way merge")))
+                      ((symbol-function 'denote-notion--finish-conflict-resolution)
+                       (lambda (f content) (setq captured-file f captured-content content))))
+              (denote-notion-resolve-conflict file)))
+        (delete-directory denote-notion-cache-directory t))
+      (should (equal captured-file file))
+      (should (equal captured-content "## Body\n\nBody content here.")))))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; denote-notion--finish-conflict-resolution
+
+(ert-deftest test-denote-notion/finish-conflict-resolution-writes-clears-and-force-pushes ()
+  "Writes MERGED-CONTENT as FILE's body, clears notion_conflict, and force-pushes."
+  (test-denote-notion--with-fixture test-denote-notion--md-fixture
+    (denote-notion--frontmatter-set file "notion_conflict" t)
+    (let (push-args)
+      (cl-letf (((symbol-function 'denote-notion-push)
+                 (lambda (&optional f p force) (push (list f p force) push-args))))
+        (denote-notion--finish-conflict-resolution file "## Merged\n\nResolved body."))
+      (should (equal (denote-notion--body-without-front-matter file) "## Merged\n\nResolved body."))
+      (should-not (denote-notion--conflicted-p file))
+      (should (equal push-args (list (list file nil t)))))))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; denote-notion--dash-register-view
+
+(ert-deftest test-denote-notion/dash-register-view-adds-entry ()
+  "Registers a `denote-dash-view' with the given name and grep-filter."
+  (let ((denote-dash-saved-views nil))
+    (denote-notion--dash-register-view "some-view" "some-regexp")
+    (should (equal (length denote-dash-saved-views) 1))
+    (let ((view (car denote-dash-saved-views)))
+      (should (equal (denote-dash-view-name view) "some-view"))
+      (should (equal (denote-dash-view-grep-filter view) "some-regexp")))))
+
+(ert-deftest test-denote-notion/dash-register-view-replaces-existing-same-name ()
+  "Re-registering under a name already present replaces that entry rather
+than appending a duplicate."
+  (let ((denote-dash-saved-views
+         (list (make-denote-dash-view :name "some-view" :grep-filter "stale"))))
+    (denote-notion--dash-register-view "some-view" "fresh")
+    (should (equal (length denote-dash-saved-views) 1))
+    (should (equal (denote-dash-view-grep-filter (car denote-dash-saved-views)) "fresh"))))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; denote-notion-dash-view-tracked
+
+(ert-deftest test-denote-notion/dash-view-tracked-registers-and-opens ()
+  "Registers a view named `denote-notion--dash-view-tracked-name' and opens
+it via `denote-dash-open-view'."
+  (let ((denote-dash-saved-views nil)
+        (opened nil))
+    (cl-letf (((symbol-function 'denote-dash-open-view)
+               (lambda (name) (setq opened name))))
+      (denote-notion-dash-view-tracked))
+    (should (equal opened denote-notion--dash-view-tracked-name))
+    (should (seq-find (lambda (v) (equal (denote-dash-view-name v)
+                                         denote-notion--dash-view-tracked-name))
+                      denote-dash-saved-views))))
+
+(ert-deftest test-denote-notion/dash-view-tracked-grep-filter-matches-tracked-fixture ()
+  "The registered grep-filter matches a tracked note's content."
+  (let ((denote-dash-saved-views nil))
+    (cl-letf (((symbol-function 'denote-dash-open-view) #'ignore))
+      (denote-notion-dash-view-tracked))
+    (let ((regexp (denote-dash-view-grep-filter
+                   (seq-find (lambda (v) (equal (denote-dash-view-name v)
+                                                denote-notion--dash-view-tracked-name))
+                             denote-dash-saved-views))))
+      (should (string-match-p regexp test-denote-notion--md-fixture))
+      (should-not (string-match-p regexp test-denote-notion--untracked-fixture)))))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; denote-notion-dash-view-conflicts
+
+(ert-deftest test-denote-notion/dash-view-conflicts-registers-and-opens ()
+  "Registers a view named `denote-notion--dash-view-conflicts-name' and
+opens it via `denote-dash-open-view'."
+  (let ((denote-dash-saved-views nil)
+        (opened nil))
+    (cl-letf (((symbol-function 'denote-dash-open-view)
+               (lambda (name) (setq opened name))))
+      (denote-notion-dash-view-conflicts))
+    (should (equal opened denote-notion--dash-view-conflicts-name))))
+
+(ert-deftest test-denote-notion/dash-view-conflicts-grep-filter-matches-conflicted-only ()
+  "The registered grep-filter matches a note with `notion_conflict' set to
+t, but not an untouched or cleared note -- the same distinction
+`denote-notion--conflicted-p' itself makes."
+  (test-denote-notion--with-fixture test-denote-notion--md-fixture
+    (let ((denote-dash-saved-views nil))
+      (cl-letf (((symbol-function 'denote-dash-open-view) #'ignore))
+        (denote-notion-dash-view-conflicts))
+      (let ((regexp (denote-dash-view-grep-filter
+                     (seq-find (lambda (v) (equal (denote-dash-view-name v)
+                                                  denote-notion--dash-view-conflicts-name))
+                               denote-dash-saved-views))))
+        (should-not (with-temp-buffer
+                      (insert-file-contents file)
+                      (goto-char (point-min))
+                      (re-search-forward regexp nil t)))
+        (denote-notion--frontmatter-set file "notion_conflict" t)
+        (should (with-temp-buffer
+                  (insert-file-contents file)
+                  (goto-char (point-min))
+                  (re-search-forward regexp nil t)))
+        (denote-notion--frontmatter-set file "notion_conflict" "")
+        (should-not (with-temp-buffer
+                      (insert-file-contents file)
+                      (goto-char (point-min))
+                      (re-search-forward regexp nil t)))))))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; denote-notion--remote-dirty-p / denote-notion--mark-remote-dirty
+
+(ert-deftest test-denote-notion/remote-dirty-p-true-when-marked ()
+  "A note with notion_remote_dirty set to t is remote-dirty."
+  (test-denote-notion--with-fixture test-denote-notion--md-fixture
+    (denote-notion--mark-remote-dirty file t)
+    (should (denote-notion--remote-dirty-p file))))
+
+(ert-deftest test-denote-notion/remote-dirty-p-false-absent ()
+  "A note with no notion_remote_dirty line is not remote-dirty."
+  (test-denote-notion--with-fixture test-denote-notion--md-fixture
+    (should-not (denote-notion--remote-dirty-p file))))
+
+(ert-deftest test-denote-notion/remote-dirty-p-false-cleared ()
+  "A note whose notion_remote_dirty was cleared to the empty string is not
+remote-dirty."
+  (test-denote-notion--with-fixture test-denote-notion--md-fixture
+    (denote-notion--mark-remote-dirty file t)
+    (denote-notion--mark-remote-dirty file nil)
+    (should-not (denote-notion--remote-dirty-p file))))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; denote-notion-dash-view-remote-updated
+
+(ert-deftest test-denote-notion/dash-view-remote-updated-registers-and-opens ()
+  "Registers a view named `denote-notion--dash-view-remote-updated-name',
+opens it immediately via `denote-dash-open-view', and does not block on
+the per-note async refresh (stubbed here to simply record which files it
+was invoked for, rather than running any real process)."
+  (let ((denote-dash-saved-views nil)
+        (opened nil)
+        (refreshed-for nil))
+    (cl-letf (((symbol-function 'denote-dash-open-view)
+               (lambda (name) (setq opened name)))
+              ((symbol-function 'denote-directory-files) (lambda (&rest _) nil))
+              ((symbol-function 'denote-notion--refresh-remote-dirty-marker-async)
+               (lambda (file on-done) (push file refreshed-for) (funcall on-done))))
+      (denote-notion-dash-view-remote-updated))
+    (should (equal opened denote-notion--dash-view-remote-updated-name))
+    (should (seq-find (lambda (v) (equal (denote-dash-view-name v)
+                                         denote-notion--dash-view-remote-updated-name))
+                      denote-dash-saved-views))
+    (should-not refreshed-for)))
+
+(ert-deftest test-denote-notion/dash-view-remote-updated-kicks-off-refresh-per-tracked-file ()
+  "Kicks off the per-note async refresh for every currently Notion-tracked
+file, and only tracked files."
+  (test-denote-notion--with-fixture test-denote-notion--md-fixture
+    (let ((untracked-file (make-temp-file "denote-notion-test" nil ".md")))
+      (unwind-protect
+          (progn
+            (with-temp-file untracked-file (insert test-denote-notion--untracked-fixture))
+            (let ((denote-dash-saved-views nil)
+                  (refreshed-for nil))
+              (cl-letf (((symbol-function 'denote-dash-open-view) #'ignore)
+                        ((symbol-function 'denote-directory-files)
+                         (lambda (&rest _) (list file untracked-file)))
+                        ((symbol-function 'denote-notion--refresh-remote-dirty-marker-async)
+                         (lambda (f on-done) (push f refreshed-for) (funcall on-done))))
+                (denote-notion-dash-view-remote-updated))
+              (should (equal refreshed-for (list file)))))
+        (delete-file untracked-file)))))
+
+(ert-deftest test-denote-notion/dash-view-remote-updated-grep-filter-matches-dirty-only ()
+  "The registered grep-filter matches a note marked `notion_remote_dirty',
+but not an untouched or cleared one."
+  (test-denote-notion--with-fixture test-denote-notion--md-fixture
+    (let ((denote-dash-saved-views nil))
+      (cl-letf (((symbol-function 'denote-dash-open-view) #'ignore)
+                ((symbol-function 'denote-directory-files) (lambda (&rest _) nil)))
+        (denote-notion-dash-view-remote-updated))
+      (let ((regexp (denote-dash-view-grep-filter
+                     (seq-find (lambda (v) (equal (denote-dash-view-name v)
+                                                  denote-notion--dash-view-remote-updated-name))
+                               denote-dash-saved-views))))
+        (should-not (string-match-p regexp (with-temp-buffer
+                                              (insert-file-contents file)
+                                              (buffer-string))))
+        (denote-notion--mark-remote-dirty file t)
+        (should (string-match-p regexp (with-temp-buffer
+                                          (insert-file-contents file)
+                                          (buffer-string))))))))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; denote-notion dash-view grep filters: four-state fixture matrix
+;;
+;; Each of the three `denote-notion-dash-view-*' grep filters was
+;; previously only exercised pairwise -- a single fixture toggled between
+;; two states in place.  This checks all three filters together against
+;; one four-file matrix (tracked+conflicted, tracked+clean, untracked,
+;; tracked+remote-dirty) in a single temp directory, confirming each
+;; filter discriminates correctly across every state in combination.
+
+(ert-deftest test-denote-notion/dash-views-grep-filters-against-four-state-fixture-matrix ()
+  "The tracked/conflict/remote-dirty grep filters each match exactly the
+right subset of a four-file fixture matrix covering every combination of
+tracked, conflicted, and remote-dirty state."
+  (test-denote-notion--with-temp-denote-dir dir
+    (let* ((tracked-conflicted (expand-file-name "20260101T000000--a__tag.md" dir))
+           (tracked-clean (expand-file-name "20260101T000001--b__tag.md" dir))
+           (untracked (expand-file-name "20260101T000002--c__tag.md" dir))
+           (tracked-remote-dirty (expand-file-name "20260101T000003--d__tag.md" dir)))
+      (with-temp-file tracked-conflicted
+        (insert "---\ntitle: \"A\"\nidentifier: \"20260101T000000\"\nnotion_id: \"id-a\"\n---\n\nbody\n"))
+      (with-temp-file tracked-clean
+        (insert "---\ntitle: \"B\"\nidentifier: \"20260101T000001\"\nnotion_id: \"id-b\"\n---\n\nbody\n"))
+      (with-temp-file untracked (insert test-denote-notion--untracked-fixture))
+      (with-temp-file tracked-remote-dirty
+        (insert "---\ntitle: \"D\"\nidentifier: \"20260101T000003\"\nnotion_id: \"id-d\"\n---\n\nbody\n"))
+      (denote-notion--frontmatter-set tracked-conflicted "notion_conflict" t)
+      (denote-notion--mark-remote-dirty tracked-remote-dirty t)
+      (let* ((tracked-regexp (denote-notion--frontmatter-nonempty-value-regexp "notion_id"))
+             (conflict-regexp denote-notion--dash-conflict-grep-filter)
+             (remote-dirty-regexp denote-notion--dash-remote-dirty-grep-filter)
+             (matches-p (lambda (regexp f)
+                          (with-temp-buffer
+                            (insert-file-contents f)
+                            (goto-char (point-min))
+                            (and (re-search-forward regexp nil t) t)))))
+        ;; tracked filter: matches every tracked file, excludes the untracked one
+        (should (funcall matches-p tracked-regexp tracked-conflicted))
+        (should (funcall matches-p tracked-regexp tracked-clean))
+        (should (funcall matches-p tracked-regexp tracked-remote-dirty))
+        (should-not (funcall matches-p tracked-regexp untracked))
+        ;; conflict filter: matches only the conflicted file
+        (should (funcall matches-p conflict-regexp tracked-conflicted))
+        (should-not (funcall matches-p conflict-regexp tracked-clean))
+        (should-not (funcall matches-p conflict-regexp untracked))
+        (should-not (funcall matches-p conflict-regexp tracked-remote-dirty))
+        ;; remote-dirty filter: matches only the remote-dirty file
+        (should-not (funcall matches-p remote-dirty-regexp tracked-conflicted))
+        (should-not (funcall matches-p remote-dirty-regexp tracked-clean))
+        (should-not (funcall matches-p remote-dirty-regexp untracked))
+        (should (funcall matches-p remote-dirty-regexp tracked-remote-dirty))))))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; denote-notion--remote-timestamp-stale-p
+
+(ert-deftest test-denote-notion/remote-timestamp-stale-p-true-when-remote-newer ()
+  "A remote timestamp lexically greater than the stored one is stale."
+  (should (denote-notion--remote-timestamp-stale-p
+           "2026-01-01T00:00:00.000Z" "2026-02-01T00:00:00.000Z")))
+
+(ert-deftest test-denote-notion/remote-timestamp-stale-p-false-when-equal ()
+  "An unchanged remote timestamp (equal to the stored one) is not stale."
+  (should-not (denote-notion--remote-timestamp-stale-p
+               "2026-01-01T00:00:00.000Z" "2026-01-01T00:00:00.000Z")))
+
+(ert-deftest test-denote-notion/remote-timestamp-stale-p-false-when-older ()
+  "A remote timestamp lexically less than the stored one is not stale."
+  (should-not (denote-notion--remote-timestamp-stale-p
+               "2026-02-01T00:00:00.000Z" "2026-01-01T00:00:00.000Z")))
+
+(ert-deftest test-denote-notion/remote-timestamp-stale-p-false-when-stored-empty ()
+  "A missing/empty stored timestamp (nothing recorded as synced yet) is
+never considered stale -- the conservative default."
+  (should-not (denote-notion--remote-timestamp-stale-p "" "2026-02-01T00:00:00.000Z")))
+
+(ert-deftest test-denote-notion/remote-timestamp-stale-p-false-when-remote-nil ()
+  "A nil remote timestamp (fetch failed to report one) is never stale."
+  (should-not (denote-notion--remote-timestamp-stale-p "2026-01-01T00:00:00.000Z" nil)))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; denote-notion--refresh-remote-dirty-marker-async
+;;
+;; `denote-notion--run-json-async' is stubbed throughout -- these tests
+;; exercise only the pure "given this stored/remote timestamp pair, is the
+;; marker set correctly" decision, not any live process or network call.
+
+(ert-deftest test-denote-notion/refresh-remote-dirty-marker-async-marks-dirty-when-stale ()
+  "Marks the file dirty when the stubbed fetch reports a newer
+`last_edited_time' than the file's own stored `notion_edited'."
+  (test-denote-notion--with-fixture test-denote-notion--md-fixture
+    (let (on-done-called)
+      (cl-letf (((symbol-function 'denote-notion--run-json-async)
+                 (lambda (_args callback)
+                   (funcall callback nil '((page . ((last_edited_time . "2026-03-01T00:00:00.000Z"))))))))
+        (denote-notion--refresh-remote-dirty-marker-async
+         file (lambda () (setq on-done-called t))))
+      (should on-done-called)
+      (should (denote-notion--remote-dirty-p file)))))
+
+(ert-deftest test-denote-notion/refresh-remote-dirty-marker-async-clears-when-unchanged ()
+  "Clears (or leaves unset) the dirty marker when the stubbed fetch reports
+the same `last_edited_time' already stored."
+  (test-denote-notion--with-fixture test-denote-notion--md-fixture
+    (cl-letf (((symbol-function 'denote-notion--run-json-async)
+               (lambda (_args callback)
+                 (funcall callback nil '((page . ((last_edited_time . "2026-02-23T18:18:00.000Z"))))))))
+      (denote-notion--refresh-remote-dirty-marker-async file #'ignore))
+    (should-not (denote-notion--remote-dirty-p file))))
+
+(ert-deftest test-denote-notion/refresh-remote-dirty-marker-async-calls-on-done-on-failed-fetch ()
+  "Still calls ON-DONE, without touching the marker, when the stubbed
+fetch reports failure (a non-nil ERROR)."
+  (test-denote-notion--with-fixture test-denote-notion--md-fixture
+    (let (on-done-called)
+      (cl-letf (((symbol-function 'denote-notion--run-json-async)
+                 (lambda (_args callback) (funcall callback "ntn failed" nil))))
+        (denote-notion--refresh-remote-dirty-marker-async
+         file (lambda () (setq on-done-called t))))
+      (should on-done-called)
+      (should-not (denote-notion--remote-dirty-p file)))))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; denote-notion--batch-run
+;;
+;; Items are held open (DONE-FN collected rather than invoked immediately)
+;; so the test controls exactly when each "in-flight" item finishes,
+;; letting it assert the max-concurrent bound is actually enforced --
+;; invoking DONE-FN synchronously and immediately, as a real `ntn' call
+;; never does, would make every dispatch-call complete before the next
+;; one starts, masking any concurrency bug entirely.
+
+(defun test-denote-notion--list-generator (items)
+  "Return a `gen' struct yielding each of ITEMS in order."
+  (gen-wrap (iter-make (dolist (item items) (iter-yield item)))))
+
+(ert-deftest test-denote-notion/batch-run-respects-max-concurrent-bound ()
+  "Never more than MAX-CONCURRENT items are in flight at once, across a
+run of more items than the bound, and `on-complete' fires exactly once,
+after every item has finished."
+  (let* ((max-concurrent 3)
+         (items (number-sequence 1 10))
+         (current-in-flight 0)
+         (max-seen 0)
+         (pending nil)
+         (completed nil)
+         (finished-count 0))
+    (denote-notion--batch-run
+     (test-denote-notion--list-generator items)
+     max-concurrent
+     (lambda (item done)
+       (setq current-in-flight (1+ current-in-flight))
+       (setq max-seen (max max-seen current-in-flight))
+       (push (cons item done) pending))
+     (lambda () (setq finished-count (1+ finished-count))))
+    (should (equal current-in-flight max-concurrent))
+    (should (equal max-seen max-concurrent))
+    (should (zerop finished-count))
+    ;; Release every pending item one at a time, in whatever order they
+    ;; were collected, re-checking the bound after each release -- the
+    ;; dispatcher must never let more than MAX-CONCURRENT back in flight
+    ;; even as slots are freed one by one.
+    (while pending
+      (let* ((entry (pop pending))
+             (done (cdr entry)))
+        (setq current-in-flight (1- current-in-flight))
+        (funcall done)
+        (should (<= current-in-flight max-concurrent))))
+    (should (equal max-seen max-concurrent))
+    (should (equal finished-count 1))
+    (should (equal (length completed) 0))))
+
+(ert-deftest test-denote-notion/batch-run-empty-generator-completes-immediately ()
+  "`on-complete' fires immediately, with nothing ever dispatched, for an
+already-empty generator."
+  (let ((dispatched nil) (completed nil))
+    (denote-notion--batch-run
+     (test-denote-notion--list-generator nil)
+     4
+     (lambda (_item _done) (setq dispatched t))
+     (lambda () (setq completed t)))
+    (should-not dispatched)
+    (should completed)))
+
+(ert-deftest test-denote-notion/batch-run-zero-max-concurrent-completes-without-dispatch ()
+  "A nonpositive MAX-CONCURRENT (the `(<= max-concurrent 0)' branch in
+`denote-notion--batch-run') calls ON-COMPLETE immediately without ever
+pulling an item from GENERATOR, even when the generator is nonempty --
+distinct from the already-covered degenerate empty-generator case, which
+exercises the same early return via an empty generator instead of a
+nonpositive bound."
+  (let ((dispatched nil) (completed nil))
+    (denote-notion--batch-run
+     (test-denote-notion--list-generator '(1 2 3))
+     0
+     (lambda (_item _done) (setq dispatched t))
+     (lambda () (setq completed t)))
+    (should-not dispatched)
+    (should completed)))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; denote-notion--sync-all-process-note: per-classification dispatch
+;;
+;; Each test stubs `denote-notion--sync-state-async' directly (rather than
+;; its own dependencies) to pin the classification outcome, then asserts
+;; both which action function ran and which COUNTS cell was incremented.
+
+(ert-deftest test-denote-notion/sync-all-process-note-unchanged-takes-no-action ()
+  "`unchanged' increments the `unchanged' count and calls neither push nor
+pull nor sets a conflict flag."
+  (test-denote-notion--with-fixture test-denote-notion--md-fixture
+    (let ((counts (list (cons 'unchanged 0) (cons 'pushed 0) (cons 'pulled 0)
+                         (cons 'conflicted 0) (cons 'errored 0)))
+          (done-called nil))
+      (cl-letf (((symbol-function 'denote-notion--sync-state-async)
+                 (lambda (_file callback) (funcall callback nil 'unchanged)))
+                ((symbol-function 'denote-notion--export-push-async)
+                 (lambda (&rest args) (error "unexpected push: %S" args)))
+                ((symbol-function 'denote-notion--import-refresh-file-async)
+                 (lambda (&rest args) (error "unexpected pull: %S" args))))
+        (denote-notion--sync-all-process-note file counts (lambda () (setq done-called t))))
+      (should done-called)
+      (should (equal (cdr (assq 'unchanged counts)) 1))
+      (should (equal (cdr (assq 'pushed counts)) 0))
+      (should-not (denote-notion--conflicted-p file)))))
+
+(ert-deftest test-denote-notion/sync-all-process-note-local-only-pushes ()
+  "`local-only' calls `denote-notion--export-push-async' (not a second
+sync-state fetch) and increments the `pushed' count."
+  (test-denote-notion--with-fixture test-denote-notion--md-fixture
+    (let ((counts (list (cons 'unchanged 0) (cons 'pushed 0) (cons 'pulled 0)
+                         (cons 'conflicted 0) (cons 'errored 0)))
+          (done-called nil) (pushed-file nil))
+      (cl-letf (((symbol-function 'denote-notion--sync-state-async)
+                 (lambda (_file callback) (funcall callback nil 'local-only)))
+                ((symbol-function 'denote-notion--export-push-async)
+                 (lambda (f callback) (setq pushed-file f) (funcall callback nil (cons "url" nil))))
+                ((symbol-function 'denote-notion--import-refresh-file-async)
+                 (lambda (&rest args) (error "unexpected pull: %S" args))))
+        (denote-notion--sync-all-process-note file counts (lambda () (setq done-called t))))
+      (should done-called)
+      (should (equal pushed-file file))
+      (should (equal (cdr (assq 'pushed counts)) 1)))))
+
+(ert-deftest test-denote-notion/sync-all-process-note-remote-only-pulls ()
+  "`remote-only' calls `denote-notion--import-refresh-file-async' (not a
+second sync-state fetch) and increments the `pulled' count."
+  (test-denote-notion--with-fixture test-denote-notion--md-fixture
+    (let ((counts (list (cons 'unchanged 0) (cons 'pushed 0) (cons 'pulled 0)
+                         (cons 'conflicted 0) (cons 'errored 0)))
+          (done-called nil) (pulled-file nil) (pulled-id nil))
+      (cl-letf (((symbol-function 'denote-notion--sync-state-async)
+                 (lambda (_file callback) (funcall callback nil 'remote-only)))
+                ((symbol-function 'denote-notion--export-push-async)
+                 (lambda (&rest args) (error "unexpected push: %S" args)))
+                ((symbol-function 'denote-notion--import-refresh-file-async)
+                 (lambda (f id callback) (setq pulled-file f pulled-id id) (funcall callback nil))))
+        (denote-notion--sync-all-process-note file counts (lambda () (setq done-called t))))
+      (should done-called)
+      (should (equal pulled-file file))
+      (should (equal pulled-id "2f094bf7-31a4-8081-8280-f0a225af4db2"))
+      (should (equal (cdr (assq 'pulled counts)) 1)))))
+
+(ert-deftest test-denote-notion/sync-all-process-note-both-changed-marks-conflict ()
+  "`both-changed' sets `notion_conflict' directly, without a `user-error',
+and increments the `conflicted' count, calling neither push nor pull."
+  (test-denote-notion--with-fixture test-denote-notion--md-fixture
+    (let ((counts (list (cons 'unchanged 0) (cons 'pushed 0) (cons 'pulled 0)
+                         (cons 'conflicted 0) (cons 'errored 0)))
+          (done-called nil))
+      (cl-letf (((symbol-function 'denote-notion--sync-state-async)
+                 (lambda (_file callback) (funcall callback nil 'both-changed)))
+                ((symbol-function 'denote-notion--export-push-async)
+                 (lambda (&rest args) (error "unexpected push: %S" args)))
+                ((symbol-function 'denote-notion--import-refresh-file-async)
+                 (lambda (&rest args) (error "unexpected pull: %S" args))))
+        (denote-notion--sync-all-process-note file counts (lambda () (setq done-called t))))
+      (should done-called)
+      (should (denote-notion--conflicted-p file))
+      (should (equal (cdr (assq 'conflicted counts)) 1)))))
+
+(ert-deftest test-denote-notion/sync-all-process-note-classification-error-is-errored ()
+  "A classification failure (ERROR non-nil from `denote-notion--sync-state-async')
+increments the `errored' count rather than signaling or hanging."
+  (test-denote-notion--with-fixture test-denote-notion--md-fixture
+    (let ((counts (list (cons 'unchanged 0) (cons 'pushed 0) (cons 'pulled 0)
+                         (cons 'conflicted 0) (cons 'errored 0)))
+          (done-called nil))
+      (cl-letf (((symbol-function 'denote-notion--sync-state-async)
+                 (lambda (_file callback) (funcall callback "ntn failed" nil))))
+        (denote-notion--sync-all-process-note file counts (lambda () (setq done-called t))))
+      (should done-called)
+      (should (equal (cdr (assq 'errored counts)) 1)))))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; denote-notion-sync-all: end to end, one failing note among several
+;; does not halt the batch
+
+(ert-deftest test-denote-notion/sync-all-one-error-does-not-halt-other-notes ()
+  "With three tracked notes -- one that errors classifying, one `unchanged',
+one `local-only' -- the batch still finishes, with all three outcomes
+correctly reflected in the summary rather than the run stopping at the
+first failure."
+  (test-denote-notion--with-temp-denote-dir dir
+    (let* ((denote-directory (list dir))
+           (file-err (expand-file-name "20260101T000000--errors__tag.md" dir))
+           (file-unchanged (expand-file-name "20260101T000001--unchanged__tag.md" dir))
+           (file-push (expand-file-name "20260101T000002--pushes__tag.md" dir))
+           (summary nil))
+      (dolist (f (list file-err file-unchanged file-push))
+        (with-temp-file f
+          (insert (format "---\ntitle: \"%s\"\nidentifier: \"%s\"\nnotion_id: \"%s\"\n---\n\nbody\n"
+                          (file-name-base f) (file-name-base f) (file-name-base f)))))
+      (cl-letf (((symbol-function 'denote-notion--sync-state-async)
+                 (lambda (f callback)
+                   (cond
+                    ((equal f file-err) (funcall callback "ntn failed" nil))
+                    ((equal f file-unchanged) (funcall callback nil 'unchanged))
+                    ((equal f file-push) (funcall callback nil 'local-only)))))
+                ((symbol-function 'denote-notion--export-push-async)
+                 (lambda (_f callback) (funcall callback nil (cons "url" nil))))
+                ((symbol-function 'message)
+                 (lambda (fmt &rest args) (setq summary (apply #'format fmt args)))))
+        (denote-notion-sync-all))
+      (should summary)
+      (should (string-match-p "1 unchanged" summary))
+      (should (string-match-p "1 pushed" summary))
+      (should (string-match-p "1 errored" summary))
+      (should (string-match-p "0 pulled" summary))
+      (should (string-match-p "0 conflicted" summary)))))
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; denote-notion-sync-all: two notes erroring simultaneously, serial
+;; (max-concurrent 1) degradation, and the zero-tracked-notes degenerate
+;; case
+
+(ert-deftest test-denote-notion/sync-all-two-simultaneous-errors-do-not-halt-batch ()
+  "With four tracked notes -- two that error classifying and two
+`unchanged' -- the batch still finishes, correctly counting both errors.
+Since the stubbed `denote-notion--sync-state-async' invokes its callback
+synchronously, all four notes' dispatch-and-complete cycles happen within
+the same synchronous tick at the default concurrency of 4, confirming the
+dispatcher's slot-refill/`in-flight' bookkeeping does not get stuck or
+miscount when two failures land back to back rather than one at a time."
+  (test-denote-notion--with-temp-denote-dir dir
+    (let* ((denote-directory (list dir))
+           (file-err1 (expand-file-name "20260101T000000--err1__tag.md" dir))
+           (file-err2 (expand-file-name "20260101T000001--err2__tag.md" dir))
+           (file-ok1 (expand-file-name "20260101T000002--ok1__tag.md" dir))
+           (file-ok2 (expand-file-name "20260101T000003--ok2__tag.md" dir))
+           (summary nil))
+      (dolist (f (list file-err1 file-err2 file-ok1 file-ok2))
+        (with-temp-file f
+          (insert (format "---\ntitle: \"%s\"\nidentifier: \"%s\"\nnotion_id: \"%s\"\n---\n\nbody\n"
+                          (file-name-base f) (file-name-base f) (file-name-base f)))))
+      (cl-letf (((symbol-function 'denote-notion--sync-state-async)
+                 (lambda (f callback)
+                   (if (member f (list file-err1 file-err2))
+                       (funcall callback "ntn failed" nil)
+                     (funcall callback nil 'unchanged))))
+                ((symbol-function 'message)
+                 (lambda (fmt &rest args) (setq summary (apply #'format fmt args)))))
+        (denote-notion-sync-all))
+      (should summary)
+      (should (string-match-p "2 unchanged" summary))
+      (should (string-match-p "2 errored" summary))
+      (should (string-match-p "0 pushed" summary))
+      (should (string-match-p "0 pulled" summary))
+      (should (string-match-p "0 conflicted" summary)))))
+
+(ert-deftest test-denote-notion/batch-run-max-concurrent-one-is-fully-serial ()
+  "With MAX-CONCURRENT 1, `denote-notion--batch-run' never has more than one
+item dispatched at once -- the pool degrades to fully serial processing
+at the boundary of the smallest nonzero concurrency, not just the default
+of 3 `--batch-run-respects-max-concurrent-bound' already covers.  Uses the
+same held-open-DONE-FN technique as that test, for the same reason: a
+synchronously-completing PROCESS-FN would collapse any MAX-CONCURRENT
+value down to serial via plain call-stack recursion, masking a real bound
+violation rather than proving its absence."
+  (let* ((max-concurrent 1)
+         (items (number-sequence 1 5))
+         (current-in-flight 0) (max-seen 0) (pending nil) (finished-count 0))
+    (denote-notion--batch-run
+     (test-denote-notion--list-generator items)
+     max-concurrent
+     (lambda (item done)
+       (setq current-in-flight (1+ current-in-flight))
+       (setq max-seen (max max-seen current-in-flight))
+       (push (cons item done) pending))
+     (lambda () (setq finished-count (1+ finished-count))))
+    (should (equal current-in-flight 1))
+    (should (equal max-seen 1))
+    (while pending
+      (let* ((entry (pop pending)) (done (cdr entry)))
+        (setq current-in-flight (1- current-in-flight))
+        (funcall done)
+        (should (<= current-in-flight 1))))
+    (should (equal max-seen 1))
+    (should (equal finished-count 1))))
+
+(ert-deftest test-denote-notion/sync-all-max-concurrent-one-completes-correctly ()
+  "With `denote-notion-batch-max-concurrent-processes' set to 1, a full
+`denote-notion-sync-all' run over several tracked notes still completes
+and reports every note's outcome correctly -- the true concurrency bound
+itself is proven at the `denote-notion--batch-run' level (see
+`--batch-run-max-concurrent-one-is-fully-serial'); this confirms the
+value actually threads through to a working end-to-end serial run."
+  (test-denote-notion--with-temp-denote-dir dir
+    (let* ((denote-directory (list dir))
+           (denote-notion-batch-max-concurrent-processes 1)
+           (files (list (expand-file-name "20260101T000000--one__tag.md" dir)
+                        (expand-file-name "20260101T000001--two__tag.md" dir)
+                        (expand-file-name "20260101T000002--three__tag.md" dir)))
+           (summary nil))
+      (dolist (f files)
+        (with-temp-file f
+          (insert (format "---\ntitle: \"%s\"\nidentifier: \"%s\"\nnotion_id: \"%s\"\n---\n\nbody\n"
+                          (file-name-base f) (file-name-base f) (file-name-base f)))))
+      (cl-letf (((symbol-function 'denote-notion--sync-state-async)
+                 (lambda (_f callback) (funcall callback nil 'unchanged)))
+                ((symbol-function 'message)
+                 (lambda (fmt &rest args) (setq summary (apply #'format fmt args)))))
+        (denote-notion-sync-all))
+      (should (string-match-p "3 unchanged" summary)))))
+
+(ert-deftest test-denote-notion/sync-all-zero-tracked-notes-reports-all-zero-summary ()
+  "With no tracked notes at all under `denote-directory' (only an untracked
+note present), `denote-notion-sync-all' still completes and reports an
+all-zero summary -- the degenerate already-empty generator case
+`denote-notion--batch-run''s own docstring calls out, exercised here
+through the real `denote-notion-sync-all' entry point."
+  (test-denote-notion--with-temp-denote-dir dir
+    (let* ((denote-directory (list dir))
+           (untracked (expand-file-name "20260101T000000--untracked__tag.md" dir))
+           (summary nil))
+      (with-temp-file untracked (insert test-denote-notion--untracked-fixture))
+      (cl-letf (((symbol-function 'message)
+                 (lambda (fmt &rest args) (setq summary (apply #'format fmt args)))))
+        (denote-notion-sync-all))
+      (should summary)
+      (should (string-match-p "0 unchanged" summary))
+      (should (string-match-p "0 pushed" summary))
+      (should (string-match-p "0 pulled" summary))
+      (should (string-match-p "0 conflicted" summary))
+      (should (string-match-p "0 errored" summary)))))
 
 (provide 'test-denote-notion)
 ;;; test-denote-notion.el ends here
