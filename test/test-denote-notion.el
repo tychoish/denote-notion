@@ -738,9 +738,8 @@ after the registry entry's display name has been renamed."
 ;; denote-notion--export-update, FORCE non-nil: end-to-end through the
 ;; literal `denote-notion--export-update' call site, not just
 ;; `denote-notion--export-apply-pushed-page' in isolation -- confirms the
-;; FORCE branch's "apply pushed page" logic, extracted into that shared
-;; helper during the cleanup sweep, still records the pushed content's
-;; hash and cache snapshot correctly when reached from this call site.
+;; shared helper still records the pushed content's hash and cache
+;; snapshot correctly when reached from this call site.
 
 (ert-deftest test-denote-notion/export-update-force-records-synced-content-hash-and-cache ()
   "A FORCE push through `denote-notion--export-update' records the pushed
@@ -1263,8 +1262,7 @@ never invoked at all."
 ;; does not user-error
 
 (ert-deftest test-denote-notion/export-update-both-changed-sets-conflict-flag-no-error ()
-  "On `both-changed', `notion_conflict' is set and no `user-error' is raised
-\(this replaces the old unconditional `user-error' on a stale push\);
+  "On `both-changed', `notion_conflict' is set and no `user-error' is raised;
 `ntn pages edit' is never invoked."
   (test-denote-notion--with-fixture test-denote-notion--md-fixture
     (denote-notion--frontmatter-set file "notion_sync_hash" "stale-hash")
@@ -1332,14 +1330,12 @@ this is what `denote-notion-resolve-conflict' checks to pick
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; denote-notion-resolve-conflict: two-way `ediff-buffers' fallback
-;; (no cached ancestor) -- this had no direct test at all before now; only
-;; `denote-notion--build-conflict-buffers' (buffer construction) and
-;; `denote-notion--finish-conflict-resolution' (write-back/push) were
-;; covered separately.  This confirms the actual buffer-selection logic
-;; inside `denote-notion-resolve-conflict''s own finish lambda: with no
-;; ancestor, the LOCAL buffer's text -- not `ediff-buffer-C', which only a
-;; three-way `ediff-merge-buffers-with-ancestor' session ever populates --
-;; is what gets passed to `denote-notion--finish-conflict-resolution'.
+;; (no cached ancestor) -- confirms the buffer-selection logic inside
+;; `denote-notion-resolve-conflict''s own finish lambda: with no
+;; ancestor, the LOCAL buffer's text -- not `ediff-buffer-C', which only
+;; a three-way `ediff-merge-buffers-with-ancestor' session ever
+;; populates -- is what gets passed to
+;; `denote-notion--finish-conflict-resolution'.
 
 (ert-deftest test-denote-notion/resolve-conflict-two-way-fallback-uses-local-buffer-as-merged-text ()
   "With no cached ancestor, the two-way `ediff-buffers' fallback's finish
@@ -1561,12 +1557,11 @@ but not an untouched or cleared one."
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; denote-notion dash-view grep filters: four-state fixture matrix
 ;;
-;; Each of the three `denote-notion-dash-view-*' grep filters was
-;; previously only exercised pairwise -- a single fixture toggled between
-;; two states in place.  This checks all three filters together against
-;; one four-file matrix (tracked+conflicted, tracked+clean, untracked,
-;; tracked+remote-dirty) in a single temp directory, confirming each
-;; filter discriminates correctly across every state in combination.
+;; Checks all three `denote-notion-dash-view-*' grep filters together
+;; against one four-file matrix (tracked+conflicted, tracked+clean,
+;; untracked, tracked+remote-dirty) in a single temp directory,
+;; confirming each filter discriminates correctly across every
+;; combination of state.
 
 (ert-deftest test-denote-notion/dash-views-grep-filters-against-four-state-fixture-matrix ()
   "The tracked/conflict/remote-dirty grep filters each match exactly the
