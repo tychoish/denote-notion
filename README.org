@@ -7,9 +7,6 @@
 Two-way synchronization between Denote notes and Notion pages in Emacs.
 
 * Overview
-:PROPERTIES:
-:CUSTOM_ID: overview
-:END:
 
 =denote-notion.el= provides interactive push and pull synchronization between local
 [[https://github.com/protesilaos/denote][Denote]] notes and Notion pages via the =npx ntn= CLI wrapper.
@@ -21,9 +18,6 @@ Two-way synchronization between Denote notes and Notion pages in Emacs.
 - Configurable parent targets and schema registries for Notion databases.
 
 * Installation
-:PROPERTIES:
-:CUSTOM_ID: installation
-:END:
 
 ** Prerequisites
 Install Node.js and ensure =npx ntn= is configured with your Notion API key:
@@ -50,9 +44,6 @@ git clone https://github.com/tychoish/denote-notion.git ~/src/denote-notion
 #+end_src
 
 * Configuration
-:PROPERTIES:
-:CUSTOM_ID: configuration
-:END:
 
 Basic =use-package= configuration:
 
@@ -67,9 +58,6 @@ Basic =use-package= configuration:
 #+end_src
 
 * Workflows
-:PROPERTIES:
-:CUSTOM_ID: workflows
-:END:
 
 ** Pushing a Note to Notion
 In any Denote note buffer, invoke =M-x denote-notion-push=.
@@ -82,9 +70,6 @@ Invoke =M-x denote-notion-pull=.
 - If called with a Notion page ID or URL, it creates a new Denote note with complete front matter.
 
 * Commands & API
-:PROPERTIES:
-:CUSTOM_ID: commands
-:END:
 
 | Command               | Summary                                                     |
 |-----------------------+-------------------------------------------------------------|
@@ -92,9 +77,6 @@ Invoke =M-x denote-notion-pull=.
 | =denote-notion-pull=  | Refresh current note or import a new page from Notion ID.  |
 
 * Development
-:PROPERTIES:
-:CUSTOM_ID: development
-:END:
 
 Run the ERT test suite:
 
@@ -103,8 +85,5 @@ emacs --batch -L . -l test/test-denote-notion.el -f ert-run-tests-batch-and-exit
 #+end_src
 
 * License
-:PROPERTIES:
-:CUSTOM_ID: license
-:END:
 
 GPL-3.0-or-later. See =LICENSE= for details.
