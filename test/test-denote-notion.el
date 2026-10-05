@@ -73,14 +73,22 @@ Untracked body.
 ")
 
 (defmacro test-denote-notion--with-fixture (content &rest body)
-  "Write CONTENT to a temp file, bind it as `file', and run BODY."
+  "Write CONTENT to a temp file, bind it as `file', and run BODY.
+Also rebinds `denote-notion-cache-directory' to a fresh temp directory
+for the duration of BODY, removed afterward -- any code path reached
+from BODY that writes a sync cache snapshot (`denote-notion--export-create',
+`denote-notion--export-update', `denote-notion--import-refresh-file', ...)
+must never touch the real, user-configured cache directory just because
+a test happened to exercise it without its own explicit binding."
   (declare (indent 1))
-  `(let ((file (make-temp-file "denote-notion-test" nil ".md")))
+  `(let ((file (make-temp-file "denote-notion-test" nil ".md"))
+         (denote-notion-cache-directory (make-temp-file "denote-notion-cache-test-" t)))
      (unwind-protect
          (progn
            (with-temp-file file (insert ,content))
            ,@body)
        (delete-file file)
+       (delete-directory denote-notion-cache-directory t)
        (when-let* ((buf (get-file-buffer file)))
          (with-current-buffer buf (set-buffer-modified-p nil))
          (kill-buffer buf)))))
@@ -94,9 +102,17 @@ filename-embedded identifier directly.  Cleanup kills any buffer still
 visiting a file under DIR-VAR -- `find-file-noselect'/`denote' leave
 one behind, and a lingering modified buffer from one test can otherwise
 bleed into another -- then deletes DIR-VAR itself, both unconditionally
-via `unwind-protect' so a failing assertion in BODY still cleans up."
+via `unwind-protect' so a failing assertion in BODY still cleans up.
+
+Also rebinds `denote-notion-cache-directory' to a fresh temp directory
+for the duration of BODY, removed afterward -- same reasoning as
+`test-denote-notion--with-fixture''s identical binding: several of
+this macro's own callers (`denote-notion-push' end-to-end) write a
+sync cache snapshot, and must never touch the real, user-configured
+cache directory just because a test happened to exercise that path."
   (declare (indent 1))
-  `(let ((,dir-var (make-temp-file "denote-notion-test-" t)))
+  `(let ((,dir-var (make-temp-file "denote-notion-test-" t))
+         (denote-notion-cache-directory (make-temp-file "denote-notion-cache-test-" t)))
      (unwind-protect
          (progn ,@body)
        (dolist (buf (buffer-list))
@@ -104,7 +120,8 @@ via `unwind-protect' so a failing assertion in BODY still cleans up."
            (when (string-prefix-p (expand-file-name ,dir-var) (expand-file-name f))
              (with-current-buffer buf (set-buffer-modified-p nil))
              (kill-buffer buf))))
-       (delete-directory ,dir-var t))))
+       (delete-directory ,dir-var t)
+       (delete-directory denote-notion-cache-directory t))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; denote-notion--frontmatter-get

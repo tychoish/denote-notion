@@ -101,7 +101,16 @@ Denote itself, and tooling like `denote-dash'/`denote-sequence', scan
 every file under the denote directory as a candidate note; a cache
 snapshot of a Notion page's last-synced content is not itself a note
 and must never show up in a listing, tag search, or sequence hierarchy
-alongside real notes."
+alongside real notes.
+
+This default is deliberately plain -- a single, portable location under
+`user-emacs-directory', with no assumption about any particular
+multi-instance or XDG state-path convention a given Emacs setup may
+use.  A setup that needs this cache scoped per host/instance (e.g. via
+`sprite-state-path') should `setq' this variable to that scoped path as
+part of its own init, the same way it already does for
+`savehist-file'/`url-configuration-directory'/etc., rather than this
+package guessing at or depending on that convention itself."
   :type 'directory
   :group 'denote-notion)
 
