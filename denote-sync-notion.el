@@ -535,7 +535,16 @@ Calls (CALLBACK ERROR RESULT)."
 
 (defun denote-notion--export-push-async (file callback)
   "Export push asynchronously for FILE in Notion."
-  (denote-sync--export-push-async file (denote-sync-get-backend 'notion) callback))
+  (let* ((backend (denote-sync-get-backend 'notion))
+         (id (denote-sync--get-id file backend)))
+    (pcase-let ((`(,content . ,_dangling) (denote-sync--export-body file backend)))
+      (funcall (denote-sync-backend-async-push-fn backend)
+               file id content
+               (lambda (err res)
+                 (unless err
+                   (denote-sync--record-synced-content
+                    file backend id content (plist-get res :edited-time)))
+                 (funcall callback err res))))))
 
 (defun denote-notion--refresh-remote-dirty-marker-async (file callback)
   "Refresh remote dirty marker asynchronously for FILE in Notion."

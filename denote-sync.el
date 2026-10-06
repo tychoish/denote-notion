@@ -880,7 +880,7 @@ With REMOTE-ID (an id or URL):
                                      (fboundp 'denote-notion--export-push-async))
                                 (denote-notion--export-push-async
                                  file
-                                 (lambda (err res)
+                                 (lambda (err _res)
                                    (if err (record 'errored) (record 'pushed))))
                               (funcall (denote-sync-backend-async-push-fn backend)
                                        file id content
@@ -991,6 +991,9 @@ With REMOTE-ID (an id or URL):
                nil))))
 
 (defvar denote-dash-saved-views)
+(declare-function make-denote-dash-view "denote-dash")
+(declare-function denote-dash-view-name "denote-dash")
+(declare-function denote-dash-open-view "denote-dash")
 
 (defun denote-sync--dash-register-view (name grep-filter)
   "Register or update a saved view named NAME in `denote-dash-saved-views'."

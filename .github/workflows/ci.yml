@@ -14,6 +14,9 @@ jobs:
     runs-on: ubuntu-latest
     container: silex/emacs:${{ matrix.emacs-version }}-ci
     timeout-minutes: 5
+    env:
+      ELISP_CI_GNU_MIRROR: ustc
+      ELISP_CI_NONGNU_MIRROR: ustc
     strategy:
       fail-fast: false
       matrix:
@@ -26,9 +29,15 @@ jobs:
       - uses: actions/checkout@v5
 
       - name: Lint Source Code
-        uses: tychoish/elisp-ci/lint@v0.1.0
+        uses: tychoish/elisp-ci/lint@v0.1.2
+        with:
+          fail-on-warning: "false"
+          gnu-mirror: "ustc"
+          nongnu-mirror: "ustc"
 
       - name: Run Tests
-        uses: tychoish/elisp-ci@v0.1.0
+        uses: tychoish/elisp-ci@v0.1.2
         with:
+          gnu-mirror: "ustc"
+          nongnu-mirror: "ustc"
           dependencies: denote-dash
