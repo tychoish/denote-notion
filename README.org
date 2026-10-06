@@ -1,24 +1,31 @@
-#+TITLE: denote-notion.el
+#+TITLE: denote-sync.el
 #+AUTHOR: sam kleinman
 #+EMAIL: sam@tychoish.com
 #+LANGUAGE: en
 #+OPTIONS: toc:2 num:nil
 
-Two-way synchronization between Denote notes and Notion pages in Emacs.
+Two-way synchronization between Denote notes and remote services (Notion, Google Docs) in Emacs.
 
 * Overview
 :PROPERTIES:
 :CUSTOM_ID: overview
 :END:
 
-=denote-notion.el= provides interactive push and pull synchronization between local
-[[https://github.com/protesilaos/denote][Denote]] notes and Notion pages via the =npx ntn= CLI wrapper.
+=denote-sync.el= provides interactive push and pull synchronization between local
+[[https://github.com/protesilaos/denote][Denote]] notes and remote services via modular backends:
+
+- *Notion* (=denote-sync-notion.el=) via the =npx ntn= CLI wrapper.
+- *Google Docs* (=denote-sync-gdocs.el=) via the =gog= CLI wrapper.
 
 ** Features
-- Push current Denote note to Notion (=denote-notion-push=), creating a new page or updating existing content.
-- Pull a Notion page into Denote (=denote-notion-pull=), refreshing tracked files or creating new notes with metadata preserved.
-- Automatic YAML front matter tracking (=notion_id=, =notion_created=, =notion_edited=, =source_url=).
-- Configurable parent targets and schema registries for Notion databases.
+- Push current Denote note to remote (=denote-sync-push=), creating or updating remote documents.
+- Pull remote documents into Denote (=denote-sync-pull=), refreshing tracked files or creating new notes with metadata preserved.
+- Content-hash change detection (=unchanged=, =local-only=, =remote-only=, =both-changed=).
+- Three-way interactive conflict resolution via Ediff (=denote-sync-resolve-conflict=) with cached merge ancestors.
+- Bounded async batch sync across all tracked notes (=denote-sync-all=).
+- Integration with =denote-dash= saved views for tracked, conflicted, and remote-updated notes.
+- Automatic YAML front matter tracking (=<prefix>_id=, =<prefix>_created=, =<prefix>_edited=, =<prefix>_sync_hash=, =<prefix>_conflict=).
+- Configurable parent registry (=denote-sync-parent-registry=) with ACR selection.
 
 * Installation
 :PROPERTIES:
@@ -26,27 +33,19 @@ Two-way synchronization between Denote notes and Notion pages in Emacs.
 :END:
 
 ** Prerequisites
-Install Node.js and ensure =npx ntn= is configured with your Notion API key:
-
-#+begin_src bash
-npx ntn --help
-#+end_src
-
-** ELPAish Installation
-Add =denote-notion= to your ELPAish bootstrap packages:
-
-#+begin_src emacs-lisp
-(elpaish-install-add-bootstrap-packages '(denote-notion))
-#+end_src
+- For Notion sync: Node.js and =ntn= (=npx ntn=).
+- For Google Docs sync: =gog= CLI (=go install github.com/openclaw/gogcli/cmd/gog@latest=).
 
 ** Manual Installation
 #+begin_src bash
-git clone https://github.com/tychoish/denote-notion.git ~/src/denote-notion
+git clone https://github.com/tychoish/denote-sync.git ~/src/denote-sync
 #+end_src
 
 #+begin_src emacs-lisp
-(add-to-list 'load-path "~/src/denote-notion")
-(require 'denote-notion)
+(add-to-list 'load-path "~/src/denote-sync")
+(require 'denote-sync)
+(require 'denote-sync-notion) ; optional
+(require 'denote-sync-gdocs)  ; optional
 #+end_src
 
 * Configuration
@@ -57,39 +56,31 @@ git clone https://github.com/tychoish/denote-notion.git ~/src/denote-notion
 Basic =use-package= configuration:
 
 #+begin_src emacs-lisp
-(use-package denote-notion
+(use-package denote-sync
   :ensure t
   :defer t
-  :commands (denote-notion-push denote-notion-pull)
-  :custom
-  (denote-notion-ntn-executable "npx")
-  (denote-notion-ntn-args '("ntn")))
+  :commands (denote-sync-push denote-sync-pull denote-sync-resolve-conflict denote-sync-all))
+
+(use-package denote-sync-notion
+  :ensure t
+  :after denote-sync)
+
+(use-package denote-sync-gdocs
+  :ensure t
+  :after denote-sync)
 #+end_src
-
-* Workflows
-:PROPERTIES:
-:CUSTOM_ID: workflows
-:END:
-
-** Pushing a Note to Notion
-In any Denote note buffer, invoke =M-x denote-notion-push=.
-If the note was not previously tracked, you are prompted to select a Notion parent
-(page or database). Subsequent pushes update the remote page directly.
-
-** Pulling a Page from Notion
-Invoke =M-x denote-notion-pull=.
-- If called in an already tracked note, it refreshes the body from Notion.
-- If called with a Notion page ID or URL, it creates a new Denote note with complete front matter.
 
 * Commands & API
 :PROPERTIES:
 :CUSTOM_ID: commands
 :END:
 
-| Command               | Summary                                                     |
-|-----------------------+-------------------------------------------------------------|
-| =denote-notion-push=  | Create or update the Notion page for the current note.     |
-| =denote-notion-pull=  | Refresh current note or import a new page from Notion ID.  |
+| Command                         | Summary                                                           |
+|---------------------------------+-------------------------------------------------------------------|
+| =denote-sync-push=              | Create or update the remote document for the current note.       |
+| =denote-sync-pull=              | Refresh current note or import a new note from a remote ID/URL.   |
+| =denote-sync-resolve-conflict=  | Three-way Ediff merge session against cached sync ancestor.       |
+| =denote-sync-all=               | Bounded async batch sync over all tracked notes across backends.  |
 
 * Development
 :PROPERTIES:
@@ -99,7 +90,7 @@ Invoke =M-x denote-notion-pull=.
 Run the ERT test suite:
 
 #+begin_src bash
-emacs --batch -L . -l test/test-denote-notion.el -f ert-run-tests-batch-and-exit
+emacs --batch --eval '(package-initialize)' -L . -l test/test-denote-sync.el -l test/test-denote-sync-notion.el -l test/test-denote-sync-gdocs.el -f ert-run-tests-batch-and-exit
 #+end_src
 
 * License
