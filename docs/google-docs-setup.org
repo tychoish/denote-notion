@@ -1,0 +1,278 @@
+#+TITLE: Google Docs Backend Setup & Multi-Account Guide
+#+AUTHOR: sam kleinman
+#+EMAIL: sam@tychoish.com
+#+LANGUAGE: en
+#+OPTIONS: toc:2 num:nil
+
+This guide walks through configuring Google Docs synchronization in =denote-sync=
+using the =gog= CLI, including setting up Google Cloud OAuth credentials, configuring
+secure headless authentication, and seamlessly managing multiple Google accounts.
+
+* Table of Contents
+:PROPERTIES:
+:CUSTOM_ID: toc
+:END:
+
+- [[#architecture][Architecture & Overview]]
+- [[#prerequisites][Prerequisites]]
+- [[#step-1-google-cloud-project--oauth-credentials][Step 1: Google Cloud Project & OAuth Credentials]]
+- [[#step-2-install-and-configure-gog-cli][Step 2: Install and Configure gog CLI]]
+- [[#step-3-authenticating-accounts][Step 3: Authenticating Accounts (Single & Multiple)]]
+- [[#step-4-emacs-configuration][Step 4: Emacs Configuration]]
+- [[#step-5-multi-account-workflow][Step 5: Multi-Account Workflow]]
+- [[#troubleshooting][Troubleshooting & Diagnostics]]
+
+* Architecture & Overview
+:PROPERTIES:
+:CUSTOM_ID: architecture
+:END:
+
+=denote-sync-gdocs= synchronizes local Denote notes with Google Docs via =gog=, an
+open-source CLI tool for Google Workspace.
+
+When a note is synchronized:
+- *Export*: Org notes are converted to GitHub Flavored Markdown; Markdown notes have their
+  YAML front-matter cleanly stripped before uploading.
+- *Push*: Creates a new Google Doc (or overwrites an existing document if already tracked).
+- *Pull*: Fetches the remote Google Doc and its revision metadata, detecting local vs remote changes.
+- *Metadata Tracking*: =denote-sync-gdocs= stores tracking metadata in the note's YAML front-matter:
+  #+begin_src yaml
+  gdoc_id: "1bZtEcHRcff_m05cw2Q6gtusYwRUYBfYzJDJoZ-5ie_4"
+  gdoc_account: "user@example.com"
+  gdoc_folder: "0AABGCYFsVQcEUk9PVA"
+  gdoc_created: "2026-10-07T03:15:23.073Z"
+  gdoc_edited: "2026-10-07T03:16:25.774Z"
+  gdoc_sync_hash: "bc4c83432e7a187a85a1ee18e077a5c7ef35f658"
+  #+end_src
+
+Because each note explicitly records its =gdoc_account=, notes belonging to different
+identities (e.g. personal, work, community) can coexist in the same Denote directory
+and will always synchronize against the correct Google account.
+
+* Prerequisites
+:PROPERTIES:
+:CUSTOM_ID: prerequisites
+:END:
+
+- Go 1.22+ (for building =gog=)
+- Emacs 29+ with =denote= installed
+- A Google account (personal Gmail or Google Workspace)
+
+* Step 1: Google Cloud Project & OAuth Credentials
+:PROPERTIES:
+:CUSTOM_ID: step-1-google-cloud-project--oauth-credentials
+:END:
+
+Google requires an OAuth 2.0 Client ID to access Docs and Drive on your behalf.
+
+1. *Create a Google Cloud Project*:
+   - Navigate to the [[https://console.cloud.google.com/][Google Cloud Console]].
+   - Click the project dropdown at the top and select *New Project*.
+   - Name it (e.g. =denote-sync=) and click *Create*.
+
+2. *Enable APIs*:
+   - Go to *APIs & Services* -> *Enabled APIs & services* -> *+ ENABLE APIS AND SERVICES*.
+   - Search for and enable:
+     - *Google Docs API* (=docs.googleapis.com=)
+     - *Google Drive API* (=drive.googleapis.com=)
+
+3. *Configure OAuth Consent Screen*:
+   - Go to *APIs & Services* -> *OAuth consent screen*.
+   - Choose User Type: *External* (or *Internal* if using Google Workspace organization).
+   - Fill in:
+     - App name: =denote-sync=
+     - User support email: your email
+     - Developer contact email: your email
+   - Under *Scopes*, add:
+     - =.../auth/documents=
+     - =.../auth/drive=
+     - =.../auth/userinfo.email=
+     - =openid=
+   - Under *Test users*, click *+ ADD USERS* and enter all Google account emails you intend
+     to sync with (e.g. personal email, work email).
+   - Save and finish.
+
+4. *Create OAuth 2.0 Client ID*:
+   - Go to *APIs & Services* -> *Credentials* -> *+ CREATE CREDENTIALS* -> *OAuth client ID*.
+   - Application type: *Desktop app*.
+   - Name: =denote-sync-client=.
+   - Click *Create*.
+   - Download the client secrets JSON file (e.g. =gog_auth.json=).
+   - Store this file in a secure location (such as =~/.config/gog/credentials.json=) and
+     *never commit it to version control*.
+
+* Step 2: Install and Configure gog CLI
+:PROPERTIES:
+:CUSTOM_ID: step-2-install-and-configure-gog-cli
+:END:
+
+1. *Install =gog=*:
+   #+begin_src bash
+   go install github.com/openclaw/gogcli/cmd/gog@latest
+   # Ensure it is in PATH (or copy to /usr/local/bin/gog)
+   sudo ln -sf ~/go/bin/gog /usr/local/bin/gog
+   #+end_src
+
+2. *Import OAuth Credentials*:
+   Register the downloaded client secret JSON file with =gog=:
+   #+begin_src bash
+   gog auth credentials set ~/.config/gog/credentials.json --insecure
+   #+end_src
+
+3. *Configure Keyring Backend*:
+   By default, =gog= attempts to use the system GPG/pass keyring. In Emacs background
+   processes or batch modes, GPG pinentry prompts will block or fail with
+   =gpg: Sorry, we are in batchmode - can't get input=.
+
+   To allow seamless, headless execution in Emacs, switch =gog= to its encrypted file keyring:
+   #+begin_src bash
+   gog auth keyring file
+   #+end_src
+
+   Choose a passphrase (or set one in your shell profile):
+   #+begin_src bash
+   export GOG_KEYRING_PASSWORD="your-secure-keyring-passphrase"
+   #+end_src
+
+* Step 3: Authenticating Accounts (Single & Multiple)
+:PROPERTIES:
+:CUSTOM_ID: step-3-authenticating-accounts
+:END:
+
+You can authorize one or more Google accounts.
+
+** Authorizing from the Command Line
+To add an account:
+#+begin_src bash
+export GOG_KEYRING_PASSWORD="your-secure-keyring-passphrase"
+gog auth add user@example.com --services=docs,drive
+#+end_src
+This command opens your browser to complete Google's OAuth consent flow. Once accepted,
+the token is saved into the encrypted keyring.
+
+To add a second account (e.g. work):
+#+begin_src bash
+gog auth add work@company.com --services=docs,drive
+#+end_src
+
+** Authorizing from Inside Emacs
+You can also authorize new accounts directly inside Emacs without opening a terminal:
+#+begin_src text
+M-x denote-sync-gdocs-add-account RET
+Google account email to authorize: user@example.com RET
+#+end_src
+This launches =gog auth add= in an Emacs process buffer (*gog-auth*) and prompts your browser.
+
+** Verifying Accounts
+Check your registered accounts:
+#+begin_src bash
+gog auth list
+gog auth doctor
+#+end_src
+
+* Step 4: Emacs Configuration
+:PROPERTIES:
+:CUSTOM_ID: step-4-emacs-configuration
+:END:
+
+Add the following to your =~/.emacs.d/init.el= or =~/.emacs.d/lisp/setup-core.el=:
+
+#+begin_src emacs-lisp
+(use-package denote-sync
+  :load-path "~/src/denote-sync"
+  :defer t
+  :commands (denote-sync-push
+             denote-sync-pull
+             denote-sync-resolve-conflict
+             denote-sync-all
+             denote-sync-gdocs-set-account
+             denote-sync-gdocs-add-account)
+  :init
+  ;; Provide the file keyring passphrase to Emacs subprocesses
+  (unless (getenv "GOG_KEYRING_PASSWORD")
+    (setenv "GOG_KEYRING_PASSWORD" "your-secure-keyring-passphrase"))
+  :config
+  (require 'denote-sync-gdocs)
+
+  ;; Set your primary default Google account
+  (setq denote-sync-gdocs-default-account "user@example.com")
+
+  ;; Optional: Register named parents with designated accounts and folders
+  (setq denote-sync-parent-registry
+        '(("Personal Notes" google-docs ("user@example.com" . "folder-id-personal"))
+          ("Work Projects"  google-docs ("work@company.com" . "folder-id-work")))))
+#+end_src
+
+* Step 5: Multi-Account Workflow
+:PROPERTIES:
+:CUSTOM_ID: step-5-multi-account-workflow
+:END:
+
+=denote-sync-gdocs= handles multi-account operations automatically:
+
+** 1. Account Resolution Precedence
+When pushing or pulling a note, the Google account is resolved in order:
+1. *Front Matter*: The =gdoc_account= property in the note's YAML front-matter.
+2. *Named Parent*: The account associated with the chosen registry parent.
+3. *Global Default*: =denote-sync-gdocs-default-account=.
+4. *Single Account Auto-Detection*: If only one account exists in =gog=, it is used automatically.
+
+** 2. Interactive Account Selection
+When pushing an untracked note or running interactive setup commands:
+- Prompts use =completing-read= populated by all accounts currently authorized in =gog=.
+- Pressing =RET= accepts the default account.
+- Completion candidates allow switching to another account with fuzzy or orderless matching.
+
+** 3. Stamping Account to Note
+When a new note is pushed with =denote-sync-push=, =gdoc_account= is automatically written
+to the note's front-matter. This ensures subsequent pushes, pulls, or batch syncs
+(=denote-sync-all=) always use that exact account.
+
+** 4. Switching Accounts on an Existing Note
+To reassign an existing note to a different Google account:
+#+begin_src text
+M-x denote-sync-gdocs-set-account RET
+#+end_src
+Pick the account from the completion list. The note's =gdoc_account= front-matter
+is updated immediately.
+
+** 5. Registering Target Folders by Account
+To register a new Drive folder for a specific account:
+#+begin_src text
+M-x denote-sync-gdocs-add-parent RET
+Registry entry name: Client Alpha RET
+Google account (default user@example.com): work@company.com RET
+Google Drive folder ID: 1a2b3c4d5e... RET
+#+end_src
+This registers the parent in =denote-sync-parent-registry= and copies the Elisp snippet
+to your kill ring for your =init.el=.
+
+* Troubleshooting & Diagnostics
+:PROPERTIES:
+:CUSTOM_ID: troubleshooting
+:END:
+
+** Inspecting Sync Activity
+All =gog= CLI invocations, arguments, standard output, and standard error are logged
+to the =*denote-sync-debug*= buffer in Emacs:
+#+begin_src text
+M-x switch-to-buffer RET *denote-sync-debug* RET
+#+end_src
+
+** Token Expiration or Refresh Issues
+If an authorization error occurs:
+#+begin_src bash
+gog auth login --account=user@example.com
+#+end_src
+Or check token status:
+#+begin_src bash
+gog auth doctor
+#+end_src
+
+** Reconciling Conflicts
+If a note was edited both locally and remotely in Google Docs, =denote-sync= marks the
+note with =gdoc_conflict: t= and prevents overwriting. Run:
+#+begin_src text
+M-x denote-sync-resolve-conflict RET
+#+end_src
+to open a three-way Ediff session against the last synchronized revision.

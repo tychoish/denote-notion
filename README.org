@@ -34,7 +34,7 @@ Two-way synchronization between Denote notes and remote services (Notion, Google
 
 ** Prerequisites
 - For Notion sync: Node.js and =ntn= (=npx ntn=).
-- For Google Docs sync: =gog= CLI (=go install github.com/openclaw/gogcli/cmd/gog@latest=).
+- For Google Docs sync: =gog= CLI (=go install github.com/openclaw/gogcli/cmd/gog@latest=). See [[file:docs/google-docs-setup.org][docs/google-docs-setup.org]] for complete GCP credentials, file keyring, and multi-account setup.
 
 ** Manual Installation
 #+begin_src bash
@@ -81,6 +81,9 @@ Basic =use-package= configuration:
 | =denote-sync-pull=              | Refresh current note or import a new note from a remote ID/URL.   |
 | =denote-sync-resolve-conflict=  | Three-way Ediff merge session against cached sync ancestor.       |
 | =denote-sync-all=               | Bounded async batch sync over all tracked notes across backends.  |
+| =denote-sync-gdocs-set-account= | Assign or change Google account email on current note.           |
+| =denote-sync-gdocs-add-account= | Authorize an additional Google account via OAuth in Emacs.       |
+| =denote-sync-gdocs-add-parent=  | Register named parent target with account and Drive folder ID.   |
 
 * Development
 :PROPERTIES:
