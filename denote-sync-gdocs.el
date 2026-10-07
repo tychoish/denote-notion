@@ -32,6 +32,15 @@
   :type 'string
   :group 'denote-sync-gdocs)
 
+(defcustom denote-sync-gdocs-default-account nil
+  "Default Google account (email address) for `denote-sync-gdocs'.
+Used when creating documents if no account is specified by parent, and
+as a fallback when syncing notes without a `gdoc_account' front-matter property.
+If nil, `gog' uses its own default account."
+  :type '(choice (const :tag "None (use gog default)" nil)
+                 (string :tag "Email address"))
+  :group 'denote-sync-gdocs)
+
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; Process execution
 
@@ -190,10 +199,11 @@ Calls (CALLBACK ERROR RESULT)."
 ;; Backend protocol implementation
 
 (defun denote-sync-gdocs--file-account (file)
-  "Return the Google account associated with FILE, or nil."
+  "Return the Google account associated with FILE, or fallback to default."
   (let ((acct (denote-sync-frontmatter-get file "gdoc_account")))
-    (when (and acct (not (string-empty-p acct)) (not (equal acct "\"\"")))
-      (string-trim acct "\"" "\""))))
+    (if (and acct (not (string-empty-p acct)) (not (equal acct "\"\"")))
+        (string-trim acct "\"" "\"")
+      denote-sync-gdocs-default-account)))
 
 (defun denote-sync-gdocs--create (file parent content)
   "Create a new Google Doc for FILE under PARENT with CONTENT."
@@ -201,7 +211,9 @@ Calls (CALLBACK ERROR RESULT)."
                          ((and (consp parent) (consp (car parent))) (car parent))
                          ((consp parent) parent)
                          (t (cons nil nil))))
-         (account (car actual-parent))
+         (account (or (car actual-parent)
+                      (denote-sync-gdocs--file-account file)
+                      denote-sync-gdocs-default-account))
          (folder (cdr actual-parent))
          (title (denote-sync--export-title file))
          (temp-file (make-temp-file "gdoc-create-" nil ".md")))
@@ -351,9 +363,12 @@ Calls (CALLBACK ERROR RESULT)."
      t
      account)))
 
-(defun denote-sync-gdocs--import-doc (id)
-  "Import a new Denote note from Google Doc ID."
-  (let* ((meta (denote-sync-gdocs--fetch-remote id t))
+(defun denote-sync-gdocs--import-doc (id &optional account)
+  "Import a new Denote note from Google Doc ID.
+Optional ACCOUNT specifies the Google account email; defaults to
+`denote-sync-gdocs-default-account'."
+  (let* ((acct (or account denote-sync-gdocs-default-account))
+         (meta (denote-sync-gdocs--fetch-remote id t acct))
          (name (plist-get meta :name))
          (created (plist-get meta :created-time))
          (edited (plist-get meta :edited-time))
@@ -365,6 +380,8 @@ Calls (CALLBACK ERROR RESULT)."
       (denote-sync-frontmatter-set new-file "gdoc_id" id)
       (denote-sync-frontmatter-set new-file "gdoc_created" (or created ""))
       (denote-sync-frontmatter-set new-file "gdoc_edited" (or edited ""))
+      (when (and acct (not (string-empty-p acct)))
+        (denote-sync-frontmatter-set new-file "gdoc_account" acct))
       (denote-sync--record-synced-content new-file (alist-get 'google-docs denote-sync-backends) id body edited)
       (save-buffer)
       (message "Imported %s" (file-name-nondirectory new-file))
@@ -372,9 +389,18 @@ Calls (CALLBACK ERROR RESULT)."
 
 (defun denote-sync-gdocs--read-parent ()
   "Interactively prompt for a Google Docs parent."
-  (let* ((acct (read-string "Google account (email, or empty for default): "))
-         (folder (read-string "Google Drive folder ID (or empty for root): ")))
-    (cons (unless (string-empty-p acct) acct)
+  (let* ((prompt (if (and denote-sync-gdocs-default-account
+                          (not (string-empty-p denote-sync-gdocs-default-account)))
+                     (format "Google account (email, default %s): " denote-sync-gdocs-default-account)
+                   "Google account (email, or empty for default): "))
+         (acct-raw (read-string prompt))
+         (acct (string-trim acct-raw))
+         (account (if (string-empty-p acct)
+                      denote-sync-gdocs-default-account
+                    acct))
+         (folder-raw (read-string "Google Drive folder ID (or empty for root): "))
+         (folder (string-trim folder-raw)))
+    (cons (unless (or (null account) (string-empty-p account)) account)
           (unless (string-empty-p folder) folder))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;

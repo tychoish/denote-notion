@@ -115,5 +115,44 @@
       (delete-file temp-file)
       (delete-directory denote-sync-cache-directory t))))
 
+
+(ert-deftest test-denote-sync-gdocs/file-account-fallback ()
+  "File account falls back to `denote-sync-gdocs-default-account' when not in front matter."
+  (let ((temp-file (make-temp-file "gdoc-acc-" nil ".md"))
+        (denote-sync-gdocs-default-account "fallback@example.com"))
+    (unwind-protect
+        (progn
+          (with-temp-file temp-file
+            (insert "---\ntitle: Note\n---\nBody\n"))
+          (should (equal (denote-sync-gdocs--file-account temp-file) "fallback@example.com"))
+          (with-temp-file temp-file
+            (insert "---\ntitle: Note\ngdoc_account: \"explicit@example.com\"\n---\nBody\n"))
+          (should (equal (denote-sync-gdocs--file-account temp-file) "explicit@example.com")))
+      (delete-file temp-file))))
+
+(ert-deftest test-denote-sync-gdocs/create-sets-default-account ()
+  "`denote-sync-gdocs--create' stamps `denote-sync-gdocs-default-account' when parent account is nil."
+  (let* ((backend (alist-get 'google-docs denote-sync-backends))
+         (temp-file (make-temp-file "gdoc-create-acc-" nil ".md"))
+         (denote-sync-gdocs-default-account "mydefault@example.com")
+         (denote-sync-cache-directory (make-temp-file "gdoc-cache-" t)))
+    (unwind-protect
+        (progn
+          (with-temp-file temp-file
+            (insert "---\ntitle: Default Account Note\n---\nContent\n"))
+          (cl-letf (((symbol-function 'denote-sync-gdocs--run-json)
+                     (lambda (args &optional account)
+                       (should (equal account "mydefault@example.com"))
+                       '((file . ((id . "acc-doc-123")
+                                  (webViewLink . "https://docs.google.com/document/d/acc-doc-123/edit"))))))
+                    ((symbol-function 'denote-sync-gdocs--run)
+                     (lambda (&rest _args) (list 0 "" ""))))
+            (funcall (denote-sync-backend-create-fn backend)
+                     temp-file '(nil . nil) "Content")
+            (should (equal (denote-sync-frontmatter-get temp-file "gdoc_account")
+                           "\"mydefault@example.com\""))))
+      (delete-file temp-file)
+      (delete-directory denote-sync-cache-directory t))))
+
 (provide 'test-denote-sync-gdocs)
 ;;; test-denote-sync-gdocs.el ends here
