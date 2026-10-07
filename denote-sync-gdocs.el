@@ -41,6 +41,60 @@ If nil, `gog' uses its own default account."
                  (string :tag "Email address"))
   :group 'denote-sync-gdocs)
 
+(defcustom denote-sync-gdocs-insert-title t
+  "When non-nil, prepend the note title as a top-level heading in the Doc.
+The heading is added on push and stripped on pull, so it never enters
+the note body or the content hash.  The Drive document title is always
+set to the note title."
+  :type 'boolean
+  :group 'denote-sync-gdocs)
+
+(defvar denote-sync-gdocs--double-title-answers (make-hash-table :test #'equal)
+  "Per-session answers to the \"add title above existing H1?\" prompt, by file.")
+
+(defun denote-sync-gdocs--has-h1-p (content)
+  "Return non-nil if CONTENT has a level-1 Markdown heading outside code fences."
+  (let ((in-fence nil) found)
+    (dolist (line (split-string content "\n"))
+      (cond ((string-match-p "\\`[ \t]*\\(```\\|~~~\\)" line)
+             (setq in-fence (not in-fence)))
+            ((and (not in-fence) (string-match-p "\\`# " line))
+             (setq found t))))
+    found))
+
+(defun denote-sync-gdocs--add-title-p (title content file)
+  "Return non-nil if TITLE should be prepended to CONTENT of FILE.
+When CONTENT already has a level-1 heading, ask whether to add the title
+anyway (remembered per FILE for the session); without a way to ask,
+don't double up."
+  (and denote-sync-gdocs-insert-title title (not (string-empty-p title))
+       (or (not (denote-sync-gdocs--has-h1-p content))
+           (let ((key (or file title)))
+             (pcase (gethash key denote-sync-gdocs--double-title-answers 'unset)
+               ('unset
+                (and (not noninteractive)
+                     (puthash key
+                              (y-or-n-p (format "\"%s\" already has a level-1 heading; add the title heading above it too? "
+                                                title))
+                              denote-sync-gdocs--double-title-answers)))
+               (answer answer))))))
+
+(defun denote-sync-gdocs--with-title (title content &optional file)
+  "Return CONTENT prefixed with TITLE as a Markdown H1, if enabled.
+FILE keys the double-heading prompt; see `denote-sync-gdocs--add-title-p'."
+  (if (denote-sync-gdocs--add-title-p title content file)
+      (concat "# " title "\n\n" content)
+    content))
+
+(defun denote-sync-gdocs--strip-title (title body)
+  "Remove a leading Markdown H1 equal to TITLE from BODY, if enabled."
+  (if (and denote-sync-gdocs-insert-title body title
+           (string-match (concat "\\`[ \t\n]*# +" (regexp-quote title)
+                                 "[ \t]*\\(?:\n+\\|\\'\\)")
+                         body))
+      (substring body (match-end 0))
+    body))
+
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;; Process execution
 
@@ -251,7 +305,7 @@ automatically uses the account if exactly one account is authorized in `gog'."
          (folder (cdr actual-parent))
          (title (denote-sync--export-title file))
          (temp-file (make-temp-file "gdoc-create-" nil ".md")))
-    (with-temp-file temp-file (insert content))
+    (with-temp-file temp-file (insert (denote-sync-gdocs--with-title title content file)))
     (unwind-protect
         (let* ((args (list "docs" "create" title "--file" temp-file "--json"))
                (args (if (and folder (not (string-empty-p folder)))
@@ -277,7 +331,7 @@ automatically uses the account if exactly one account is authorized in `gog'."
   (let* ((account (denote-sync-gdocs--file-account file))
          (title (denote-sync--export-title file))
          (temp-file (make-temp-file "gdoc-write-" nil ".md")))
-    (with-temp-file temp-file (insert content))
+    (with-temp-file temp-file (insert (denote-sync-gdocs--with-title title content file)))
     (unwind-protect
         (progn
           (denote-sync-gdocs--run
@@ -308,9 +362,11 @@ automatically uses the account if exactly one account is authorized in `gog'."
                     (denote-sync-gdocs--run
                      (list "docs" "export" id "--format" "md" "--out" temp-out "--overwrite")
                      account)
-                    (with-temp-buffer
-                      (insert-file-contents temp-out)
-                      (buffer-string)))
+                    (denote-sync-gdocs--strip-title
+                     name
+                     (with-temp-buffer
+                       (insert-file-contents temp-out)
+                       (buffer-string))))
                 (when (file-exists-p temp-out)
                   (delete-file temp-out)))))))
     (list :id id :name name :created-time created :edited-time edited :body body)))
@@ -336,9 +392,11 @@ automatically uses the account if exactly one account is authorized in `gog'."
                 (unwind-protect
                     (if (or (stringp err-or-code) (not (zerop err-or-code)))
                         (funcall callback (format "Export failed: %s" err-or-code) nil)
-                      (let ((body (with-temp-buffer
-                                    (insert-file-contents temp-out)
-                                    (buffer-string))))
+                      (let ((body (denote-sync-gdocs--strip-title
+                                   name
+                                   (with-temp-buffer
+                                     (insert-file-contents temp-out)
+                                     (buffer-string)))))
                         (funcall callback nil (list :id id :name name :created-time created :edited-time edited :body body))))
                   (when (file-exists-p temp-out)
                     (delete-file temp-out))))

@@ -181,5 +181,44 @@
           (should (equal (denote-sync-gdocs--file-account temp-file) "changed@example.com")))
       (delete-file temp-file))))
 
+(ert-deftest test-denote-sync-gdocs/title-heading-round-trip ()
+  "A title H1 is added on push and stripped on pull."
+  (should (equal (denote-sync-gdocs--with-title "My Note" "body")
+                 "# My Note\n\nbody"))
+  (should (equal (denote-sync-gdocs--strip-title
+                  "My Note" (denote-sync-gdocs--with-title "My Note" "body"))
+                 "body")))
+
+(ert-deftest test-denote-sync-gdocs/strip-title-only-matching-heading ()
+  "Only a leading H1 equal to the title is stripped."
+  (should (equal (denote-sync-gdocs--strip-title "A (b)" "# A (b)\nbody") "body"))
+  (should (equal (denote-sync-gdocs--strip-title "T" "# Other\n\nbody")
+                 "# Other\n\nbody"))
+  (should (equal (denote-sync-gdocs--strip-title "T" "body\n# T\n") "body\n# T\n")))
+
+(ert-deftest test-denote-sync-gdocs/title-heading-disabled ()
+  "With `denote-sync-gdocs-insert-title' nil, content passes through."
+  (let ((denote-sync-gdocs-insert-title nil))
+    (should (equal (denote-sync-gdocs--with-title "T" "body") "body"))
+    (should (equal (denote-sync-gdocs--strip-title "T" "# T\n\nbody") "# T\n\nbody"))))
+
+(ert-deftest test-denote-sync-gdocs/title-heading-prompts-on-existing-h1 ()
+  "An existing H1 triggers a prompt, remembered per file; fences are ignored."
+  (let ((denote-sync-gdocs--double-title-answers (make-hash-table :test #'equal))
+        (asked 0))
+    (cl-letf (((symbol-function 'y-or-n-p) (lambda (_) (cl-incf asked) t)))
+      (should (equal (denote-sync-gdocs--with-title "T" "```\n# not a heading\n```\nx" "f")
+                     "# T\n\n```\n# not a heading\n```\nx"))
+      (should (= asked 0))
+      (let ((noninteractive nil))
+        (should (equal (denote-sync-gdocs--with-title "T" "# H\nx" "f") "# T\n\n# H\nx"))
+        (denote-sync-gdocs--with-title "T" "# H\nx" "f")
+        (should (= asked 1))))
+    (cl-letf (((symbol-function 'y-or-n-p) (lambda (_) nil))
+              (noninteractive nil))
+      (should (equal (denote-sync-gdocs--with-title "T" "# H\nx" "g") "# H\nx")))
+    ;; Non-interactive: no prompt, no doubling.
+    (should (equal (denote-sync-gdocs--with-title "T" "# H\nx" "h") "# H\nx"))))
+
 (provide 'test-denote-sync-gdocs)
 ;;; test-denote-sync-gdocs.el ends here
