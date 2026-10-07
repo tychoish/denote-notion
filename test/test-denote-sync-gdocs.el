@@ -154,5 +154,32 @@
       (delete-file temp-file)
       (delete-directory denote-sync-cache-directory t))))
 
+
+(ert-deftest test-denote-sync-gdocs/single-account-fallback ()
+  "File account automatically falls back to single authorized account if default is nil."
+  (let ((temp-file (make-temp-file "gdoc-acc-" nil ".md"))
+        (denote-sync-gdocs-default-account nil))
+    (unwind-protect
+        (progn
+          (with-temp-file temp-file
+            (insert "---\ntitle: Single Acc Note\n---\nBody\n"))
+          (cl-letf (((symbol-function 'denote-sync-gdocs--available-accounts)
+                     (lambda () '("onlyone@example.com"))))
+            (should (equal (denote-sync-gdocs--file-account temp-file) "onlyone@example.com"))))
+      (delete-file temp-file))))
+
+(ert-deftest test-denote-sync-gdocs/set-account ()
+  "`denote-sync-gdocs-set-account' updates the note's front-matter."
+  (let ((temp-file (make-temp-file "gdoc-set-acc-" nil ".md")))
+    (unwind-protect
+        (progn
+          (with-temp-file temp-file
+            (insert "---\ntitle: Note\n---\nBody\n"))
+          (denote-sync-gdocs-set-account temp-file "changed@example.com")
+          (should (equal (denote-sync-frontmatter-get temp-file "gdoc_account")
+                         "\"changed@example.com\""))
+          (should (equal (denote-sync-gdocs--file-account temp-file) "changed@example.com")))
+      (delete-file temp-file))))
+
 (provide 'test-denote-sync-gdocs)
 ;;; test-denote-sync-gdocs.el ends here

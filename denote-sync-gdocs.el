@@ -177,14 +177,39 @@ Calls (CALLBACK ERROR RESULT)."
           (or (car parent) "default")
           (or (cdr parent) "root")))
 
+(defun denote-sync-gdocs--available-accounts ()
+  "Return a list of authorized Google account emails from `gog'."
+  (condition-case nil
+      (let* ((out (denote-sync-gdocs--run-json '("auth" "list")))
+             (accts (map-elt out 'accounts)))
+        (seq-filter (lambda (e) (and (stringp e) (not (string-empty-p e))))
+                    (seq-map (lambda (a) (map-elt a 'email)) accts)))
+    (error nil)))
+
+(defun denote-sync-gdocs--prompt-account (&optional prompt default)
+  "Prompt for a Google account email with completion over authorized accounts.
+PROMPT is the prompt string.  DEFAULT is the initial default choice."
+  (let* ((accounts (denote-sync-gdocs--available-accounts))
+         (def (or default
+                  denote-sync-gdocs-default-account
+                  (car accounts)))
+         (prompt-str (if def
+                         (format "%s(default %s): " (or prompt "Google account: ") def)
+                       (or prompt "Google account: ")))
+         (choice (completing-read prompt-str accounts nil nil nil nil def)))
+    (if (string-empty-p (string-trim choice))
+        def
+      (string-trim choice))))
+
 ;;;###autoload
 (defun denote-sync-gdocs-add-parent (name account folder-id)
   "Add a Google Docs parent target to `denote-sync-parent-registry'."
   (interactive
-   (list (read-string "Registry entry name: ")
-         (let ((acct (read-string "Google account (email, or empty for default): ")))
-           (unless (string-empty-p acct) acct))
-         (let ((folder (read-string "Google Drive folder ID (or empty for root): ")))
+   (let* ((name (read-string "Registry entry name (e.g., Team Docs, Personal): "))
+          (acct (denote-sync-gdocs--prompt-account "Google account: "))
+          (folder (read-string "Google Drive folder ID (or empty for root): ")))
+     (list name
+           (unless (string-empty-p acct) acct)
            (unless (string-empty-p folder) folder))))
   (let* ((parent (cons account folder-id))
          (entry (cons name (list 'google-docs parent)))
@@ -199,11 +224,20 @@ Calls (CALLBACK ERROR RESULT)."
 ;; Backend protocol implementation
 
 (defun denote-sync-gdocs--file-account (file)
-  "Return the Google account associated with FILE, or fallback to default."
+  "Return the Google account associated with FILE, or fallback to default.
+If no account is set on FILE and `denote-sync-gdocs-default-account' is nil,
+automatically uses the account if exactly one account is authorized in `gog'."
   (let ((acct (denote-sync-frontmatter-get file "gdoc_account")))
-    (if (and acct (not (string-empty-p acct)) (not (equal acct "\"\"")))
-        (string-trim acct "\"" "\"")
-      denote-sync-gdocs-default-account)))
+    (cond
+     ((and acct (not (string-empty-p acct)) (not (equal acct "\"\"")))
+      (string-trim acct "\"" "\""))
+     ((and denote-sync-gdocs-default-account
+           (not (string-empty-p denote-sync-gdocs-default-account)))
+      denote-sync-gdocs-default-account)
+     (t
+      (let ((accounts (denote-sync-gdocs--available-accounts)))
+        (when (= (length accounts) 1)
+          (car accounts)))))))
 
 (defun denote-sync-gdocs--create (file parent content)
   "Create a new Google Doc for FILE under PARENT with CONTENT."
@@ -389,18 +423,9 @@ Optional ACCOUNT specifies the Google account email; defaults to
 
 (defun denote-sync-gdocs--read-parent ()
   "Interactively prompt for a Google Docs parent."
-  (let* ((prompt (if (and denote-sync-gdocs-default-account
-                          (not (string-empty-p denote-sync-gdocs-default-account)))
-                     (format "Google account (email, default %s): " denote-sync-gdocs-default-account)
-                   "Google account (email, or empty for default): "))
-         (acct-raw (read-string prompt))
-         (acct (string-trim acct-raw))
-         (account (if (string-empty-p acct)
-                      denote-sync-gdocs-default-account
-                    acct))
-         (folder-raw (read-string "Google Drive folder ID (or empty for root): "))
-         (folder (string-trim folder-raw)))
-    (cons (unless (or (null account) (string-empty-p account)) account)
+  (let* ((acct (denote-sync-gdocs--prompt-account "Google account: "))
+         (folder (read-string "Google Drive folder ID (or empty for root): ")))
+    (cons (unless (string-empty-p acct) acct)
           (unless (string-empty-p folder) folder))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
@@ -423,6 +448,43 @@ Optional ACCOUNT specifies the Google account email; defaults to
   :read-parent-fn #'denote-sync-gdocs--read-parent
   :format-parent-fn #'denote-sync-gdocs--format-parent
   :parse-parent-fn nil))
+
+;;;###autoload
+(defun denote-sync-gdocs-set-account (&optional file account)
+  "Set the Google account for FILE (defaults to current note) to ACCOUNT.
+Interactively, prompts with completion over all authorized accounts in `gog'."
+  (interactive
+   (let* ((f (or (buffer-file-name) (denote-sync--prompt-file)))
+          (current (denote-sync-gdocs--file-account f))
+          (acct (denote-sync-gdocs--prompt-account
+                 (format "Set Google account for %s: " (file-name-nondirectory f))
+                 current)))
+     (list f acct)))
+  (let ((f (or file (buffer-file-name))))
+    (unless (and f (file-exists-p f))
+      (user-error "No valid file specified"))
+    (denote-sync-frontmatter-set f "gdoc_account" account)
+    (message "Set %s gdoc_account to %s" (file-name-nondirectory f) account)))
+
+;;;###autoload
+(defun denote-sync-gdocs-add-account (email)
+  "Authorize a new Google Account EMAIL using `gog'.
+Runs the OAuth login flow interactively in a process buffer."
+  (interactive "sGoogle account email to authorize: ")
+  (let* ((email (string-trim email))
+         (buf (get-buffer-create "*gog-auth*")))
+    (when (string-empty-p email)
+      (user-error "Email address cannot be empty"))
+    (with-current-buffer buf
+      (erase-buffer)
+      (insert (format "Starting OAuth authorization for %s...
+
+" email)))
+    (display-buffer buf)
+    (start-process "gog-auth" buf
+                   denote-sync-gdocs-gog-executable
+                   "auth" "add" email "--services=docs,drive")
+    (message "Started gog auth for %s in buffer *gog-auth*" email)))
 
 (provide 'denote-sync-gdocs)
 ;;; denote-sync-gdocs.el ends here
