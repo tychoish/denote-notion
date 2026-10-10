@@ -175,8 +175,10 @@ gog auth doctor
 :CUSTOM_ID: step-4-emacs-configuration
 :END:
 
-Add the following to your =~/.emacs.d/init.el= or =~/.emacs.d/lisp/setup-core.el=:
+Configuration is split cleanly between shared package loading and user-specific
+account settings:
 
+** Shared Package Loading (e.g. =~/.emacs.d/lisp/setup-core.el=)
 #+begin_src emacs-lisp
 (use-package denote-sync
   :load-path "~/src/denote-sync"
@@ -186,21 +188,29 @@ Add the following to your =~/.emacs.d/init.el= or =~/.emacs.d/lisp/setup-core.el
              denote-sync-resolve-conflict
              denote-sync-all
              denote-sync-gdocs-set-account
-             denote-sync-gdocs-add-account)
-  :init
+             denote-sync-gdocs-add-account
+             denote-sync-bootstrap)
+  :config
+  (require 'denote-sync-gdocs))
+#+end_src
+
+** Account-Specific Settings (in =~/.emacs.d/user/= e.g. =personal.el=)
+User credentials, environment variables, default accounts, and folder registries
+belong in a user configuration file under =~/.emacs.d/user/=:
+
+#+begin_src emacs-lisp
+(with-eval-after-load 'denote-sync-gdocs
   ;; Provide the file keyring passphrase to Emacs subprocesses
   (unless (getenv "GOG_KEYRING_PASSWORD")
     (setenv "GOG_KEYRING_PASSWORD" "your-secure-keyring-passphrase"))
-  :config
-  (require 'denote-sync-gdocs)
 
   ;; Set your primary default Google account
-  (setq denote-sync-gdocs-default-account "user@example.com")
+  (setq denote-sync-gdocs-default-account "garen@tychoish.com")
 
   ;; Optional: Register named parents with designated accounts and folders
   (setq denote-sync-parent-registry
-        '(("Personal Notes" google-docs ("user@example.com" . "folder-id-personal"))
-          ("Work Projects"  google-docs ("work@company.com" . "folder-id-work")))))
+        '(("Personal Notes" google-docs ("garen@tychoish.com" . "folder-id-personal"))
+          ("Work Projects"  google-docs ("work@company.com"  . "folder-id-work")))))
 #+end_src
 
 * Step 5: Multi-Account Workflow
